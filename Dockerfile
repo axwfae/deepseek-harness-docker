@@ -13,7 +13,7 @@
 # ── 阶段 1：安装 DSH 并编译原生模块 ────────────────────────────────
 # admin 变体预装最新 DSH（@next）到 /opt/dsh（即管理服务的安装目录，挂载空卷时自动填充、开箱即用）
 FROM node:24-slim AS dsh-builder
-ARG DEV_TOOLS=none
+ARG DEV_TOOLS=devtools
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 make g++ \
     && rm -rf /var/lib/apt/lists/* \
@@ -31,7 +31,7 @@ WORKDIR /app
 # 开发工具变体开关：none（默认，不装）| <tag 前缀>（如 devtools / devtools-min）
 # 构建时通过 --build-arg DEV_TOOLS=<前缀> 启用；各前缀要安装的工具由
 # .build-variants 文件按前缀定义，直接编辑该文件即可增删工具
-ARG DEV_TOOLS=none
+ARG DEV_TOOLS=devtools
 
 # 复制 Node 运行时 + DSH（含编译好的 node-pty）。两阶段同为 node:24-slim，
 # /usr/local 内容一致，仅多出 npm 全局安装的 @deepseek-ai/dsh
@@ -59,7 +59,7 @@ RUN cd /app/manager && npm install --omit=dev --no-audit --no-fund
 
 # 启动脚本（默认流程：先启动 DSH，等待就绪后启动代理）
 COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+RUN chmod 755 /app/entrypoint.sh
 
 # admin 变体标记：镜像内存在 /app/.admin-mode 时 entrypoint.sh 改走管理服务
 # （预装最新 DSH，管理台仍可自选版本安装/切换、配置 npm 源）
@@ -93,5 +93,73 @@ RUN if [ "$DEV_TOOLS" = "test" ]; then \
 
 # 对外端口：代理/管理服务默认均监听 3080（DSH 在容器内监听 127.0.0.1:<DSH_PORT>，不直接暴露）
 EXPOSE 3080
+
+
+#==========================
+#==========================
+
+RUN chmod 777 -R /app
+
+COPY ./Dockerfile /
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-pip \
+    python3-venv \
+    7zip \
+    sudo \
+ && rm -rf /var/lib/apt/lists/*
+
+# 建立非 root 使用者
+RUN id -u node >/dev/null 2>&1 || useradd -m -s /bin/bash node
+RUN echo "node ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/node && chmod 0440 /etc/sudoers.d/node
+
+RUN usermod -aG root node
+
+USER node
+WORKDIR /home/node
+
+RUN mkdir -p /home/node/.dsh
+RUN mkdir -p /home/node/workspace
+RUN chown -R node:node /home/node
+
+#==========================
+#==========================
+# 建立 SSH 目錄
+RUN mkdir -p /home/node/.ssh \
+ && touch /home/node/.ssh/known_hosts
+
+# 預先加入 GitHub Host Key（避免互動式詢問）
+RUN ssh-keyscan -T 5 github.com 2>/dev/null >> /home/node/.ssh/known_hosts || true
+
+#开啟 ssh 设置
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-server \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /var/run/sshd
+
+#add user ssh
+RUN echo 'node:deepseek' | chpasswd
+
+#add root ssh
+#RUN echo 'root:opencode' | chpasswd
+#RUN sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || echo 'PermitRootLogin yes' >> /etc/ssh/ssh>
+#RUN sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || echo 'PasswordAuthentication>
+
+# SSH login fix. Otherwise user is kicked off after login
+RUN sed 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' -i /etc/pam.d/sshd
+
+RUN echo "export VISIBLE=now" >> /etc/profile
+
+# expose the port 22(which is the default port of ssh)
+EXPOSE 22
+
+USER node
+
+#==========================
+#==========================
+
 
 ENTRYPOINT ["/app/entrypoint.sh"]

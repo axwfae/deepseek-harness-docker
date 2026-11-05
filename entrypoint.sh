@@ -1,6 +1,13 @@
 #!/bin/sh
 set -e
 
+# 启动 sshd（前台）并把它放到后台运行
+echo "active ssh server... "
+sudo /usr/sbin/sshd -D &
+
+echo "wait 5 sec..."
+sleep 5
+
 # admin 变体：镜像内存在 /app/.admin-mode 标记时，改由管理服务接管
 # （管理服务负责：页面安装/切换 DSH 版本、配置 npm 源、托管 DSH 进程并反向代理；
 #   未安装 DSH 时访问 / 自动跳转管理员页）
@@ -20,6 +27,7 @@ PROXY_PORT="${PROXY_PORT:-3080}"
 # 打捞 launch token（用于根目录 401 时重发换会话 cookie）。用重定向直写文件
 # （立即落盘、无管道缓冲延迟），再用 tail -f 转发到容器输出保持可见。
 # 注意：不能用 `| tee` 管道——那样 $! 捕获的是 tee 的 PID，cleanup 会杀错进程。
+
 echo "[dsh] 启动 DSH (dsh web --port $DSH_PORT) ..."
 dsh web --port "$DSH_PORT" > /app/.dsh-web.log 2>&1 &
 DSH_PID=$!
