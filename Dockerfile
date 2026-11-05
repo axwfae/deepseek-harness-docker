@@ -14,13 +14,18 @@
 # admin 变体预装最新 DSH（@next）到 /opt/dsh（即管理服务的安装目录，挂载空卷时自动填充、开箱即用）
 FROM node:24-slim AS dsh-builder
 ARG DEV_TOOLS=devtools
-RUN apt-get update \
+# DSH 版本：默认 next（跟随上游 next 通道，当前指向最新 rc）。
+# CI 会按触发的上游 Release 传入精确版本，例如 --build-arg DSH_VERSION=0.2.2-rc.1，
+# 保证镜像里的 DSH 版本与镜像 tag 严格一致；本地构建不传则维持原来的 @next 行为。
+ARG DSH_VERSION=next
+RUN : "${DSH_VERSION:=next}" \
+    && apt-get update \
     && apt-get install -y --no-install-recommends python3 make g++ \
     && rm -rf /var/lib/apt/lists/* \
     && if [ "$DEV_TOOLS" = "admin" ]; then \
-         npm install -g --prefix /opt/dsh --no-audit --no-fund @deepseek-ai/dsh@next; \
+         npm install -g --prefix /opt/dsh --no-audit --no-fund @deepseek-ai/dsh@"$DSH_VERSION"; \
        else \
-         npm install -g --no-audit --no-fund @deepseek-ai/dsh@next; \
+         npm install -g --no-audit --no-fund @deepseek-ai/dsh@"$DSH_VERSION"; \
        fi \
     && mkdir -p /opt/dsh
 
@@ -28,9 +33,9 @@ RUN apt-get update \
 FROM node:24-slim
 WORKDIR /app
 
-# 开发工具变体开关：none（默认，不装）| <tag 前缀>（如 devtools / devtools-min）
-# 构建时通过 --build-arg DEV_TOOLS=<前缀> 启用；各前缀要安装的工具由
-# .build-variants 文件按前缀定义，直接编辑该文件即可增删工具
+# 开发工具变体开关：<tag 前缀>（如 devtools / devtools-min）| none（不装）
+# 本文件默认 devtools（完整工具版）；构建时通过 --build-arg DEV_TOOLS=<前缀> 覆盖，
+# 各前缀要安装的工具由 .build-variants 文件按前缀定义，直接编辑该文件即可增删工具
 ARG DEV_TOOLS=devtools
 
 # 复制 Node 运行时 + DSH（含编译好的 node-pty）。两阶段同为 node:24-slim，
@@ -163,3 +168,4 @@ USER node
 
 
 ENTRYPOINT ["/app/entrypoint.sh"]
+
