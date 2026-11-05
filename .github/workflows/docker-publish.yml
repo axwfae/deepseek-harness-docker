@@ -1,0 +1,308 @@
+name: 🐳 devtools 镜像（跟随上游 Release）
+
+# ─────────────────────────────────────────────────────────────────────
+# 轮询 deepseek-ai/deepseek-harness 的新版本，构建并推送
+# 仓库变量 DOCKERHUB_REPOSITORY 指定的镜像（devtools 变体，仅 linux/amd64）。
+#
+# 为什么用 schedule 轮询，而不是 on: release：
+#   GitHub 的 release 事件只在本仓库创建 Release 时触发，不会因为上游仓库
+#   发版而触发 —— 事件不跨仓库投递。本仓库自己从不发 Release，所以
+#   on: release 等于死代码。只能定时轮询上游 Releases API。
+#
+# 上游现状（2026-11 实测）：37 个 Release 全部是 alpha 或 rc，没有任何纯
+# x.y.z 正式版；npm 上 42 个版本同样全部带后缀。因此口径定为
+# 「排除 alpha / beta / canary，接受 rc」。若改成只认正式版，本工作流
+# 会长期不触发（要等上游某天发 0.3.0 之类）。
+#
+# 权威信号是 tag 名，不是 release.prerelease 字段：后者由人工勾选，
+# 上游 37/37 全为 true，不可靠；tag 名由上游 bump.ts 生成、verify.ts 强校验。
+#
+# 上游 npm 发布是人工审批的（release-publish.yml 手动触发），可能晚于
+# Release 创建数小时，所以构建前会等待 npm 出现对应版本，最长 30 分钟。
+#
+# 去重：Docker Hub 上已有 <版本> 这个 tag 就跳过，不会每 6 小时重复构建。
+# latest：只有「当前最新版本」才更新 latest，重跑旧版本不会把 latest 回滚。
+# 镜像 tag 只有两种：<版本号>（如 0.2.2-rc.1）与 latest，两者内容相同。
+#
+# 两个 GitHub 侧的限制（不是本文件的 bug）：
+#   - schedule 只在默认分支生效：workflow 文件必须合并进 main 才会被定时触发。
+#   - 仓库连续 60 天无提交时，GitHub 会自动停用定时任务；需要偶尔有提交，
+#     或到 Actions 页面手动 Run workflow 保活。
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # 每 6 小时一次（上游发布间隔中位数约 1.2 天，6 小时足够及时）
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '指定上游 Release tag（如 dsh-v0.2.2-rc.1）；留空则自动取最新一个非 alpha 的 Release'
+        required: false
+        type: string
+        default: ''
+      force:
+        description: '即使该版本镜像已存在也强制重建'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  # 固定 group + 不取消：每轮都在追同一个「最新版本」，重复触发无害。
+  # schedule 每 6 小时一次，单次构建远短于该间隔，排队不会堆积。
+  group: docker-publish-devtools
+  cancel-in-progress: false
+
+permissions:
+  # 只推 Docker Hub，不需要 packages: write（GHCR 已按需关闭）
+  contents: read
+
+env:
+  UPSTREAM_REPO: deepseek-ai/deepseek-harness
+  NPM_PACKAGE: '@deepseek-ai/dsh'
+  # 镜像仓库名，取自仓库变量 DOCKERHUB_REPOSITORY（下面是未设置时的兜底值）。
+  # 两种写法都支持，prepare 步骤会自动归一化：
+  #   <仓库名>            如 dsh_ssh              → 拼成 <DOCKERHUB_USERNAME>/dsh_ssh
+  #   <用户名>/<仓库名>    如 wuyong1977/dsh_ssh   → 直接使用，不再拼用户名
+  IMAGE_NAME: ${{ vars.DOCKERHUB_REPOSITORY || secrets.DOCKERHUB_REPOSITORY || 'deepseek-harness' }}
+
+jobs:
+  prepare:
+    name: 🔍 解析上游版本
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.resolve.outputs.candidate == 'true' && steps.npm.outputs.available == 'true' }}
+      version: ${{ steps.resolve.outputs.version }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      push_latest: ${{ steps.resolve.outputs.push_latest }}
+      dh_repo: ${{ steps.resolve.outputs.dh_repo }}
+    steps:
+      - name: 解析上游版本并去重
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+          # 用户名允许放在 Variables 或 Secrets（两种都兼容）
+          DH_USER: ${{ vars.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          # 0) 归一化镜像仓库名：IMAGE_NAME 可能是 "name" 或 "namespace/name"
+          if printf '%s' "$IMAGE_NAME" | grep -q '/'; then
+            DH_REPO="$IMAGE_NAME"
+          else
+            if [ -z "${DH_USER:-}" ]; then
+              echo "::error::缺少 DOCKERHUB_USERNAME（Variables 或 Secrets 任一），无法拼出镜像仓库名"
+              exit 1
+            fi
+            DH_REPO="$DH_USER/$IMAGE_NAME"
+          fi
+          if ! printf '%s' "$DH_REPO" | grep -qE -- '^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)?$'; then
+            echo "::error::镜像仓库名 '$DH_REPO' 不合法：只允许小写字母/数字与 . _ -，最多一层命名空间"
+            exit 1
+          fi
+          echo "dh_repo=$DH_REPO" >> "$GITHUB_OUTPUT"
+          echo "目标镜像仓库：$DH_REPO"
+
+          # token 为空时不要发 "Bearer " 空头，否则 GitHub 会回 401
+          AUTH_ARGS=()
+          if [ -n "${GH_TOKEN:-}" ]; then AUTH_ARGS=(-H "Authorization: Bearer $GH_TOKEN"); fi
+
+          # 1) 取上游最新一个非 alpha/beta/canary 的 Release tag
+          LATEST_TAG=$(curl -fsSL "${AUTH_ARGS[@]}" \
+                          -H "Accept: application/vnd.github+json" \
+                          "https://api.github.com/repos/$UPSTREAM_REPO/releases?per_page=30" \
+                        | jq -r '[.[] | select(.draft == false)]
+                                 | map(select((.tag_name | test("-alpha|-beta|-canary"; "i")) | not))
+                                 | .[0].tag_name // empty')
+          echo "上游最新可用版本：${LATEST_TAG:-（无）}"
+
+          # 2) 决定目标 tag：手动指定优先，否则用上游最新
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TARGET_TAG="$INPUT_TAG"
+            echo "目标 tag 来自手动输入：$TARGET_TAG"
+          else
+            TARGET_TAG="$LATEST_TAG"
+            echo "目标 tag 来自上游最新版本：${TARGET_TAG:-（无）}"
+          fi
+
+          if [ -z "${TARGET_TAG:-}" ]; then
+            echo "candidate=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::没有找到可用的上游 Release tag，跳过"
+            exit 0
+          fi
+
+          # 预发布过滤：上游 tag 形如 dsh-v0.2.2-alpha.3 / dsh-v0.2.2-rc.1
+          if printf '%s' "$TARGET_TAG" | grep -qiE -- '-(alpha|beta|canary)'; then
+            echo "candidate=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::'$TARGET_TAG' 属于 alpha/beta/canary 预发布，按配置跳过"
+            exit 0
+          fi
+
+          VERSION="${TARGET_TAG#dsh-v}"
+          if ! printf '%s' "$VERSION" | grep -qE -- '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::无法从 tag '$TARGET_TAG' 解析出版本号（期望形如 dsh-v<semver>）"
+            exit 1
+          fi
+
+          # 3) latest 只跟随「当前最新版本」：重跑旧版本时不会把 latest 回滚
+          PUSH_LATEST=false
+          if [ "$TARGET_TAG" = "$LATEST_TAG" ]; then PUSH_LATEST=true; fi
+          echo "push_latest=$PUSH_LATEST" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$TARGET_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # 4) 去重：版本 tag 已存在就跳过；但若本版本是最新版本，
+          #    还要确认 latest 的 digest 与它一致，否则重建（保证 latest 始终等于最新版本号）
+          if [ "${FORCE:-false}" = "true" ]; then
+            echo "::notice::force=true，跳过去重检查"
+            echo "candidate=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          API="https://hub.docker.com/v2/repositories/$DH_REPO/tags"
+          V_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$API/$VERSION" || echo 000)
+          if [ "$V_CODE" != "200" ]; then
+            echo "candidate=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$DH_REPO:$VERSION 尚未构建，开始构建（上游 tag $TARGET_TAG）"
+            exit 0
+          fi
+
+          if [ "$PUSH_LATEST" != "true" ]; then
+            echo "candidate=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$DH_REPO:$VERSION 已存在且它不是最新版本，跳过"
+            exit 0
+          fi
+
+          V_DIGEST=$(curl -fsS "$API/$VERSION" | jq -r '.digest // empty' || true)
+          L_DIGEST=$(curl -fsS "$API/latest"   | jq -r '.digest // empty' || true)
+          if [ -n "$V_DIGEST" ] && [ "$V_DIGEST" = "$L_DIGEST" ]; then
+            echo "candidate=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$DH_REPO:$VERSION 已存在，且 latest 已指向它（digest 一致），跳过"
+          else
+            echo "candidate=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$DH_REPO:$VERSION 已存在但 latest 未指向它（版本 digest=${V_DIGEST:-未知} / latest digest=${L_DIGEST:-未知}），重建以更新 latest"
+          fi
+
+      - name: 等待 npm 上出现该版本
+        id: npm
+        if: steps.resolve.outputs.candidate == 'true'
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 作用域包名要 URL 编码：@deepseek-ai/dsh → @deepseek-ai%2Fdsh
+          ENCODED=$(printf '%s' "$NPM_PACKAGE" | sed 's#/#%2F#')
+
+          for i in $(seq 1 15); do
+            if curl -fsS -o /dev/null "https://registry.npmjs.org/$ENCODED/$VERSION"; then
+              echo "available=true" >> "$GITHUB_OUTPUT"
+              echo "npm 上已存在 $NPM_PACKAGE@$VERSION"
+              exit 0
+            fi
+            if [ "$i" -lt 15 ]; then
+              echo "第 $i/15 次：npm 上还没有 $VERSION，120 秒后重试"
+              sleep 120
+            fi
+          done
+
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::30 分钟内 npm 上仍未出现 $VERSION（上游 npm 发布走人工审批，可能晚于 Release），本轮跳过；等 npm 发布后下一轮轮询会自动接上"
+
+  build:
+    name: 🏗️ 构建并推送 devtools（linux/amd64）
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: 校验凭据与镜像名
+        env:
+          DH_USER: ${{ vars.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN || vars.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$DH_USER" ] || { echo "::error::缺少 DOCKERHUB_USERNAME（Variables 或 Secrets 任一）"; exit 1; }
+          [ -n "$DH_TOKEN" ] || { echo "::error::缺少 DOCKERHUB_TOKEN（建议放 Secrets，也兼容 Variables）"; exit 1; }
+          echo "Docker Hub 用户：$DH_USER"
+          echo "目标镜像仓库：${{ needs.prepare.outputs.dh_repo }}"
+
+      - name: 检出本仓库
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: 登录 Docker Hub
+        uses: docker/login-action@v4
+        with:
+          registry: docker.io
+          username: ${{ vars.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN || vars.DOCKERHUB_TOKEN }}
+
+      - name: 计算镜像 tag
+        id: tags
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PUSH_LATEST: ${{ needs.prepare.outputs.push_latest }}
+        run: |
+          set -euo pipefail
+          DH="docker.io/${{ needs.prepare.outputs.dh_repo }}"
+
+          # 镜像 tag 直接用版本号；latest 与最新版本同内容
+          LIST="$DH:$VERSION"
+          if [ "$PUSH_LATEST" = "true" ]; then
+            LIST="$LIST"$'\n'"$DH:latest"
+          else
+            echo "::notice::本版本不是当前最新版本，不更新 latest"
+          fi
+
+          {
+            echo "list<<__TAGS_EOF__"
+            echo "$LIST"
+            echo "__TAGS_EOF__"
+          } >> "$GITHUB_OUTPUT"
+          echo "将推送以下 tag："
+          echo "$LIST"
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            DEV_TOOLS=devtools
+            DSH_VERSION=${{ needs.prepare.outputs.version }}
+          tags: ${{ steps.tags.outputs.list }}
+          labels: |
+            org.opencontainers.image.title=deepseek-harness (devtools)
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ needs.prepare.outputs.release_tag }}
+          # 缓存按 ref 隔离：schedule 触发时 ref 是默认分支，缓存可写可复用。
+          # scope 用来和同仓库其他镜像/变体隔离，避免 mode=max 互相挤占。
+          cache-from: type=gha,scope=dsh-devtools
+          cache-to: type=gha,mode=max,scope=dsh-devtools
+
+      - name: 写入运行摘要
+        run: |
+          {
+            echo "### 🐳 devtools 镜像已推送"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 上游 tag | \`${{ needs.prepare.outputs.release_tag }}\` |"
+            echo "| DSH 版本 | \`${{ needs.prepare.outputs.version }}\` |"
+            echo "| 平台 | \`linux/amd64\` |"
+            echo "| 变体 | \`DEV_TOOLS=devtools\` |"
+            echo "| 更新 latest | \`${{ needs.prepare.outputs.push_latest }}\` |"
+            echo "| Docker Hub | \`${{ needs.prepare.outputs.dh_repo }}:${{ needs.prepare.outputs.version }}\` |"
+            echo "| 镜像 | \`docker.io/${{ needs.prepare.outputs.dh_repo }}:latest\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
