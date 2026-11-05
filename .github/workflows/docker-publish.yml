@@ -225,8 +225,22 @@ jobs:
           set -euo pipefail
           [ -n "$DH_USER" ] || { echo "::error::缺少 DOCKERHUB_USERNAME（Variables 或 Secrets 任一）"; exit 1; }
           [ -n "$DH_TOKEN" ] || { echo "::error::缺少 DOCKERHUB_TOKEN（建议放 Secrets，也兼容 Variables）"; exit 1; }
+
+          # 在本 job 内重新归一化镜像仓库名，不依赖 prepare 的 job output。
+          # 这样即使 needs.*.outputs 传空，也不会拼出 docker.io/:tag 这种非法引用。
+          echo "IMAGE_NAME 原始值：'${IMAGE_NAME:-（空）}'"
+          if printf '%s' "$IMAGE_NAME" | grep -q '/'; then
+            DH_REPO="$IMAGE_NAME"
+          else
+            DH_REPO="$DH_USER/$IMAGE_NAME"
+          fi
+          if ! printf '%s' "$DH_REPO" | grep -qE -- '^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)?$'; then
+            echo "::error::镜像仓库名解析结果 '$DH_REPO' 不合法。请检查仓库变量 DOCKERHUB_REPOSITORY（当前 '${IMAGE_NAME:-空}'）与 DOCKERHUB_USERNAME（当前 '${DH_USER:-空}'）"
+            exit 1
+          fi
+          echo "DH_REPO=$DH_REPO" >> "$GITHUB_ENV"
           echo "Docker Hub 用户：$DH_USER"
-          echo "目标镜像仓库：${{ needs.prepare.outputs.dh_repo }}"
+          echo "目标镜像仓库：$DH_REPO"
 
       - name: 检出本仓库
         uses: actions/checkout@v7
@@ -250,7 +264,12 @@ jobs:
           PUSH_LATEST: ${{ needs.prepare.outputs.push_latest }}
         run: |
           set -euo pipefail
-          DH="docker.io/${{ needs.prepare.outputs.dh_repo }}"
+          # DH_REPO 由上一个步骤写入 $GITHUB_ENV，不依赖 job output
+          if [ -z "${DH_REPO:-}" ]; then
+            echo "::error::DH_REPO 为空，镜像仓库名解析失败"
+            exit 1
+          fi
+          DH="docker.io/$DH_REPO"
 
           # 镜像 tag 直接用版本号；latest 与最新版本同内容
           LIST="$DH:$VERSION"
@@ -303,6 +322,6 @@ jobs:
             echo "| 平台 | \`linux/amd64\` |"
             echo "| 变体 | \`DEV_TOOLS=devtools\` |"
             echo "| 更新 latest | \`${{ needs.prepare.outputs.push_latest }}\` |"
-            echo "| Docker Hub | \`${{ needs.prepare.outputs.dh_repo }}:${{ needs.prepare.outputs.version }}\` |"
-            echo "| 镜像 | \`docker.io/${{ needs.prepare.outputs.dh_repo }}:latest\` |"
+            echo "| Docker Hub | \`${DH_REPO}:${{ needs.prepare.outputs.version }}\` |"
+            echo "| 镜像 | \`docker.io/${DH_REPO}:latest\` |"
           } >> "$GITHUB_STEP_SUMMARY"
