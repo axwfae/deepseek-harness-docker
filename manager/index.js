@@ -448,8 +448,9 @@ const server = http.createServer(async (req, res) => {
 
   // 其余路径：DSH 就绪则反代，否则跳到管理员页
   if (dshReady) {
-    // 根目录 GET 走 serveIndex：上游(如官方 0.1.2+)返回 401 时携带 launch token 重发一次
-    if (req.method === 'GET' && pathname === '/') {
+    // 根目录与 /index.html 都走 serveIndex：上游(如官方 0.1.2+)返回 401 时携带 launch token
+    // 重发一次；非 '/' 的入口由该模块导回 '/' 完成交换
+    if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
       const handled = await serveIndex(req, res, { origin: TARGET_ORIGIN, transformHtml: html => injectIntoHead(html, HTML_INJECT) });
       if (handled) return;
     }
