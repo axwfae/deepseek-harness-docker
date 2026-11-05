@@ -13,6 +13,81 @@ Docker 化部署 **DeepSeek Harness（DSH）** + **Node 反向代理**：
 >   代理通过注入 polyfill 解决（否则实时通道/WS 一直 pending）；
 > - 代理同时提供 **HTTP Basic Auth**，可给局域网访问加认证。
 
+## 本 fork 发布的镜像：`wuyong1977/dsh_ssh`
+
+本仓库构建并发布的镜像在 Docker Hub：
+
+- 镜像主页：**https://hub.docker.com/r/wuyong1977/dsh_ssh**
+- 拉取地址：**`wuyong1977/dsh_ssh:latest`**
+- 常见 tag：`latest`、`0.2.2-rc.1`、`0.2.1-rc.5`、`0.2.1-rc.4`、`0.2.1-rc.2`
+
+相对上游 `smanx/deepseek-harness` 的改动：
+
+1. 以普通用户 `node` 运行（非 root），避免部分程序拒绝以 root 运行；
+2. 内置 SSH 服务，可直接进入容器，账号 `node` / 密码 `deepseek`；
+3. `sudo` 免密码；
+4. `$DSH_HOME` 由 `/root/.dsh` 改为 **`/home/node/.dsh`**；
+5. 工作区开在 `/home/node/workspace`，运行中创建的文件可直接在容器外取用；
+6. 修复「`dsh web authentication required`」无法登录的问题（见下一节）。
+
+```bash
+docker pull wuyong1977/dsh_ssh:latest
+
+docker run -d \
+  --name dsh-harness \
+  --restart unless-stopped \
+  -p 3080:3080 \
+  -p 50022:22 \
+  -v dsh-data:/home/node/.dsh \
+  -v dsh-workspace:/home/node/workspace \
+  wuyong1977/dsh_ssh:latest
+```
+
+- 浏览器入口：`http://<主机>:3080/`
+- SSH 入口：`ssh -p 50022 node@<主机>`（容器内仍是 22 端口）
+- 用 podman 时可按上游写法改用 bind mount：`-v ./config:/home/node/.dsh -v ./workspace:/home/node/workspace`
+
+> 本 fork 的 Dockerfile 以 `USER node` 运行，所以容器内的 home 是 `/home/node`，
+> 数据卷必须挂到 **`/home/node/.dsh`**；挂到 `/root/.dsh` 不会生效，
+> 容器重建时会重建 cookie 签名密钥，导致所有已有会话一次性失效。
+
+## 登录修正：`dsh web authentication required`
+
+现象：浏览器打开 `http://<主机>:3080/`，只得到一行纯文本：
+
+```
+dsh web authentication required; reopen the URL printed by dsh web.
+```
+
+这是 **DSH 自身的 401**（`packages/client/connection/src/browser-auth.ts`），不是代理的 Basic Auth，
+也不是 `/api` 的信任栅栏（那是 403）。含义是：这次 `GET /` 既没带有效的 `?token=`，也没带有效的签名 cookie。
+
+本次修正改动 `proxy/upstream-token.js`，并同步放开 `proxy/index.js`、`manager/index.js` 中 `/index.html` 的入口，共六项：
+
+| # | 修正 | 解决的情况 |
+|---|---|---|
+| 1 | token 缓存改由日志 mtime 驱动，去掉永久 `state.done` | DSH 重启 / admin 变体切换版本后新 token 抓不到，所有无 cookie 的浏览器卡 401 |
+| 2 | 重送时**替换**已有的 `token` 参数（不再追加） | URL 残留旧 `?token=`（书签、历史记录）时组成 `?token=old&token=new`，上游要求恰好一个 → 永远 401 |
+| 3 | 重送仍 401 时立即作废缓存 | DSH 已换 token 但日志尚未刷新时，下一次请求自动重扫，不再永久卡死 |
+| 4 | 非 `/` 的首页入口（`/index.html`、旧深链接）302 导回 `/?token=…`，带 `__dsh_auth` 标记防重导环 | 上游只认 `GET /` 做 token 交换，`/index.html` 只会得到裸 401 |
+| 5 | 把响应 `Set-Cookie` 的 `SameSite=Strict` 改写为 `Lax`（可用 `DSH_COOKIE_SAMESITE=strict` 还原） | 手机主屏幕 App、从其他 App/链接跨站打开时首跳不带 Strict cookie → 401 或重导环（上游 discussion #5362、#9096） |
+| 6 | 外部链路为 HTTPS 时补 `Secure`（`DSH_COOKIE_SECURE`） | 反向代理终止 TLS 时 cookie 缺 `Secure`；纯 HTTP 内网不补，避免被浏览器丢弃 |
+
+行为细节：原始 query 参数会保留（`/index.html?session=abc` → `/?session=abc&token=…&__dsh_auth=1`）；
+已带 `__dsh_auth` 仍 401 时直接透传，不再重导；`Cache-Control` 只在缺失时补 `no-store`，不再重复输出。
+
+新增环境变量：
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `DSH_COOKIE_SAMESITE` | `lax` | `lax`：把上游 `SameSite=Strict` 改写为 `Lax`；`strict`：保持上游原样 |
+| `DSH_COOKIE_SECURE` | `auto` | `auto`：请求带 `x-forwarded-proto: https` 时补 `Secure`；`always` / `never` 强制开关 |
+
+修正后用户打开 `http://<主机>:3080/` **不需要看到或粘贴任何 token**：代理会自动用启动 token 换取会话 cookie。
+token 只存在于「代理 ↔ DSH」之间，因此日常也不需要关闭认证；上游没有提供关闭开关。
+
+完整说明（认证模型、全部环境变量、能否关闭 cookie/token、验证与排错）见 **[LOGIN-FIX.md](LOGIN-FIX.md)**。
+
 ## 目录结构
 
 ```
@@ -21,11 +96,13 @@ deepseek-harness/
 ├── entrypoint.sh         # 先启动 DSH，等待就绪，再启动代理（检测到 admin 变体标记则改走管理服务）
 ├── proxy/
 │   ├── index.js          # 代理（转发 + polyfill 注入 + Origin 对齐 + Basic Auth）
+│   ├── upstream-token.js # 上游 401 时用启动 token 自动换取会话 cookie（登录修正）
 │   └── package.json
 ├── manager/              # admin 变体专用：页面安装/切换 DSH 版本、配置 npm 源、托管 DSH 进程
 │   ├── index.js
 │   ├── admin.html
 │   └── package.json
+├── LOGIN-FIX.md          # 登录问题（dsh web authentication required）的修正说明
 └── README.md / README_EN.md
 ```
 
@@ -42,7 +119,7 @@ docker build -t smanx/deepseek-harness .
 docker run -d \
   --name dsh-harness \
   -p 3080:3080 \
-  -v dsh-data:/root/.dsh \
+  -v dsh-data:/home/node/.dsh \
   --restart unless-stopped \
   smanx/deepseek-harness
 
@@ -120,7 +197,7 @@ docker build -t smanx/deepseek-harness:devtools-<版本> --build-arg DEV_TOOLS=d
 docker run -d \
   --name dsh-harness \
   -p 3080:3080 \
-  -v dsh-data:/root/.dsh \
+  -v dsh-data:/home/node/.dsh \
   -v dsh-install:/opt/dsh \
   --restart unless-stopped \
   smanx/deepseek-harness:admin-latest
@@ -154,7 +231,7 @@ admin 变体另有以下环境变量：
 docker run -d \
   --name dsh-harness \
   -p 3080:3080 \
-  -v dsh-data:/root/.dsh \
+  -v dsh-data:/home/node/.dsh \
   -e DSH_PORT=3082 \
   --restart unless-stopped \
   smanx/deepseek-harness
@@ -174,7 +251,7 @@ docker run -d \
 docker run -d \
   --name dsh-harness \
   -p 3080:3080 \
-  -v dsh-data:/root/.dsh \
+  -v dsh-data:/home/node/.dsh \
   -e PROXY_USERNAME=yourname \
   -e PROXY_PASSWORD=yourpass \
   --restart unless-stopped \
@@ -190,7 +267,7 @@ docker run -d \
 
 ## 数据持久化
 
-DSH 的会话/配置数据保存在命名卷 `dsh-data`（容器内 `/root/.dsh`）。
+DSH 的会话/配置数据保存在命名卷 `dsh-data`（本 fork 容器内为 `/home/node/.dsh`，因镜像以 `USER node` 运行；上游原版为 `/root/.dsh`）。
 `docker stop/start` 与删除容器后卷仍在，数据不丢；彻底清除需先停容器再 `docker volume rm dsh-data`。
 
 ## 说明
