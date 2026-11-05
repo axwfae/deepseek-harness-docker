@@ -1,18 +1,47 @@
-// 上游自动授权（前向兼容官方 DSH 0.1.2+ 的 launch-token 机制）。
+// 上游自動授權（前向兼容官方 DSH 的 launch-token 機制）。
 //
-// 设计目标：token 完全由本镜像处理，LAN 用户经 Basic Auth 通过后，不再需要任何额外动作。
-// 关键点：绝不在每次转发时注入 token——官方模型是「launch token 换取浏览器会话 cookie」，
-// 若每请求都带 token，上游会为每个请求签发一个全新身份，出现身份错乱。
+// 設計目標：token 完全由本鏡像處理，使用者經 Basic Auth（若啟用）通過後，
+// 不再需要任何額外動作。
+//
+// 關鍵點：絕不在每次轉發時注入 token——官方模型是「launch token 換取瀏覽器
+// 會話 cookie」，若每請求都帶 token，上游會為每個請求簽發一個全新身份，
+// 出現身份錯亂。本模組只在「首頁請求被上游 401 拒絕」時補一次交換。
+//
+// 相對舊版的修正（皆對應實際踩到的無法登入情境）：
+//   1. token 快取改由日誌 mtime 驅動：DSH 重啟（admin 版切版本、手動重啟、
+//      崩潰後被宿主拉起）後會產生新 token，舊版永久快取舊值，導致所有沒有
+//      cookie 的瀏覽器永遠停在 401。
+//   2. 重送時「取代」而非「附加」token：舊版在原始網址已帶 ?token= 時會組成
+//      ?token=old&token=new，而上游要求 query 中恰好一個 token，於是永遠 401。
+//   3. 重送仍 401 時立刻作廢快取，下一個請求重新掃描日誌。
+//   4. 非 '/' 的首頁入口（/index.html、舊深連結）導回 '/' 完成交換，並用
+//      __dsh_auth 標記避免重導環；上游只認 GET / 做 token 交換。
+//   5. Set-Cookie 的 SameSite=Strict 可改寫為 Lax：安裝版 App／從其他 App
+//      開啟時，跨站頂層導航的第一跳不帶 Strict cookie，會造成 401 或重導環
+//      （上游 discussion #5362、#9096）。預設 lax，設 strict 可還原。
+//   6. 外部鏈路為 HTTPS 時（x-forwarded-proto: https）自動補 Secure，避免
+//      cookie 在 HTTPS 下缺少 Secure 而無法長時間保存。
 const fs = require('fs');
 
 const LOG_FILE = process.env.DSH_WEB_LOG || '/app/.dsh-web.log';
 const TOKEN_FILE_AUTO = process.env.DSH_TOKEN_FILE_AUTO || '/app/.dsh-launch-token';
-// 官方 DSH 0.1.2+ 的 launch token 通过「首页 URL 上的 ?token=」传入（见 dsh web 打印的
-// 地址格式），换取会话 cookie；不接受把 token 放请求头，因此这里用 query 追加。
+// 官方 DSH 的 launch token 透過首頁 URL 上的 ?token= 傳入，不接受請求頭。
 const TOKEN_QUERY_KEY = process.env.DSH_TOKEN_QUERY_KEY || 'token';
 
 const HARD_TOKEN = process.env.DSH_TOKEN || '';
 const HARD_TOKEN_FILE = process.env.DSH_TOKEN_FILE || '';
+
+// 非 '/' 入口導回 '/' 的一次性標記；帶了它仍 401 就直接透傳，不再重導。
+const AUTH_MARKER = '__dsh_auth';
+
+// cookie 屬性改寫：lax（預設）| strict（保持上游原樣）
+const COOKIE_SAMESITE = String(process.env.DSH_COOKIE_SAMESITE || 'lax').toLowerCase();
+// Secure 補寫：auto（依 x-forwarded-proto）| always | never
+const COOKIE_SECURE = String(process.env.DSH_COOKIE_SECURE || 'auto').toLowerCase();
+
+const MAX_TAIL_BYTES = 512 * 1024;
+// 抓不到 token 時，兩次掃描的最小間隔，避免每個 401 都重讀日誌。
+const SCAN_MIN_INTERVAL = 1000;
 
 let PATTERN = null;
 if (process.env.DSH_LAUNCH_TOKEN_PATTERN) {
@@ -20,9 +49,8 @@ if (process.env.DSH_LAUNCH_TOKEN_PATTERN) {
 }
 const DEFAULT_TOKEN_RE = /(?:[?&,]|^)token[=:]\s*["']?([A-Za-z0-9._~-]{16,})/i;
 
-let state = { token: '', source: null, scanning: false, attempts: 0, done: false };
-const SCAN_INTERVAL = 2000;
-const MAX_SCAN_ATTEMPTS = 30;
+// mtimeMs = -1 表示「尚未同步過」，第一次呼叫一定重掃。
+let state = { token: '', source: null, mtimeMs: -1, lastScanAt: 0 };
 
 function readTail(p, maxBytes) {
   try {
@@ -39,8 +67,8 @@ function readTail(p, maxBytes) {
   }
 }
 
-// 返回文本中 regex 的【最后一个】匹配（日志里可能有多次启动打印的旧 token，
-// 越新的打印越靠后，取最后一个即当前最新 token），无匹配返回 null。
+// 返回文本中 regex 的【最後一個】匹配（日誌裡可能有多次啟動打印的舊 token，
+// 越新的打印越靠後，取最後一個即當前最新 token），無匹配返回 null。
 function lastMatch(text, regex) {
   let re;
   try {
@@ -57,14 +85,14 @@ function lastMatch(text, regex) {
   return last;
 }
 
-// token 去敏：仅保留头尾 4 个字符，中间用 * 填充，便于日志排查又不泄露完整 token
+// token 去敏：僅保留頭尾 4 個字符，中間用 * 填充，便於日誌排查又不泄露完整 token
 function maskToken(t) {
   const s = String(t || '');
   if (s.length <= 8) return s ? s.slice(0, 1) + '****' : '(empty)';
   return s.slice(0, 4) + '****' + s.slice(-4);
 }
 
-// 从日志文本中提取最新（末尾）的 launch token
+// 從日誌文本中提取最新（末尾）的 launch token
 function extractFromText(text) {
   if (PATTERN) {
     const m = lastMatch(text, PATTERN);
@@ -74,19 +102,19 @@ function extractFromText(text) {
   return m ? m[1] : null;
 }
 
-// 打捞一次：读 DSH 日志尾部提取 token，命中则落盘到 TOKEN_FILE_AUTO
+// 打撈一次：讀 DSH 日誌尾部提取 token，命中則落盤到 TOKEN_FILE_AUTO
 function scanOnce() {
-  const token = extractFromText(readTail(LOG_FILE, 512 * 1024));
-  if (token) {
-    const t = token.trim();
-    try { fs.writeFileSync(TOKEN_FILE_AUTO, t); } catch {}
-    state.token = t;
-    state.source = 'auto';
-    state.done = true;
-    console.log(`[upstream-token] 已自动捕获 DSH launch token（长度 ${t.length}），仅用于根目录 401 时换取会话`);
-    return t;
+  state.lastScanAt = Date.now();
+  const token = extractFromText(readTail(LOG_FILE, MAX_TAIL_BYTES));
+  if (!token) return '';
+  const t = token.trim();
+  try { fs.writeFileSync(TOKEN_FILE_AUTO, t); } catch {}
+  if (t !== state.token) {
+    console.log(`[upstream-token] 已捕獲 DSH launch token（${maskToken(t)}，長度 ${t.length}），僅用於換取會話`);
   }
-  return null;
+  state.token = t;
+  state.source = 'auto';
+  return t;
 }
 
 function readHardToken() {
@@ -97,38 +125,42 @@ function readHardToken() {
   return '';
 }
 
-// 确保已拿到 token：优先手工，其次自动打捞（必要时启动周期性轮询）
-function ensureToken() {
-  if (state.done && state.token) return state.token;
+// 確保已拿到「當前 process」的 token：優先手工，其次依日誌 mtime 自動打撈。
+// 日誌一旦有更新（DSH 重啟）就立即重掃，不再永久快取第一次抓到的值。
+function ensureToken(force = false) {
   const hard = readHardToken();
   if (hard) {
     state.token = hard;
     state.source = 'manual';
-    state.done = true;
     return hard;
   }
-  const fromLog = scanOnce();
-  if (fromLog) return fromLog;
-  if (state.scanning) return state.token;
-  if (state.attempts >= MAX_SCAN_ATTEMPTS) {
-    state.done = true;
-    return '';
+
+  let mtimeMs = -1;
+  try { mtimeMs = fs.statSync(LOG_FILE).mtimeMs; } catch {}
+
+  const changed = mtimeMs !== state.mtimeMs;
+  const now = Date.now();
+  // 日誌一變就重掃；沒有可用 token 時才套用最小間隔，避免每個請求都讀日誌尾段。
+  const due = force || changed
+    || (state.token === '' && now - state.lastScanAt >= SCAN_MIN_INTERVAL);
+
+  if (due) {
+    state.mtimeMs = mtimeMs;
+    const scanned = scanOnce();
+    if (scanned) return scanned;
+    // 掃不到時保留舊 token 當備援；下一個請求（1 秒後或日誌再變）會重試。
   }
-  state.scanning = true;
-  const timer = setInterval(() => {
-    const t = scanOnce();
-    state.attempts += 1;
-    if (t || state.attempts >= MAX_SCAN_ATTEMPTS) {
-      clearInterval(timer);
-      state.scanning = false;
-      state.done = true;
-    }
-  }, SCAN_INTERVAL);
-  timer.unref();
   return state.token;
 }
 
-// 版本探测：供诊断与后续按版本细化判断；一般不需要
+// 作廢快取：token 被上游拒絕（DSH 重啟但日誌尚未刷新）時呼叫。
+function invalidateToken() {
+  state.token = '';
+  state.mtimeMs = -1;
+  state.lastScanAt = 0;
+}
+
+// 版本探測：供診斷與後續按版本細化判斷；一般不需要
 const VERSION_PATHS = [
   process.env.DSH_VERSION,
   '/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json',
@@ -146,7 +178,7 @@ function detectDshVersion() {
   return null;
 }
 
-// ── 根目录授权引导（401 → 带 token 重发 → 透传 set-cookie）─────────
+// ── 根目錄授權引導（401 → 帶 token 重發 → 透傳 set-cookie）─────────
 const FORWARD_HEADERS = [
   'accept', 'accept-language', 'user-agent', 'cookie', 'referer',
   'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site',
@@ -157,27 +189,37 @@ function pickIndexHeaders(req, dropCookie) {
   const out = { accept: '*/*', 'accept-encoding': 'identity' };
   for (let i = 0; i < FORWARD_HEADERS.length; i++) {
     const n = FORWARD_HEADERS[i];
-    // token 交换 = 换取全新会话；浏览器若带旧 cookie（过期/无效会话），
-    // 上游会因 cookie 校验失败直接 401，导致重发永远失败。因此重发时剥离。
+    // token 交換 = 換取全新會話；瀏覽器若帶舊 cookie（過期/無效會話），
+    // 上游會因 cookie 校驗失敗直接 401，導致重發永遠失敗。因此重發時剝離。
     if (dropCookie && n === 'cookie') continue;
     if (src[n]) out[n] = src[n];
   }
   return out;
 }
 
+// Node 18 的 fetch 沒有 getSetCookie；退回讀單一 set-cookie 字串。
+// （Node 24 / Bun 都走 getSetCookie，多個 cookie 不會被合併。）
+function readSetCookies(headers) {
+  if (typeof headers.getSetCookie === 'function') {
+    const list = headers.getSetCookie();
+    if (Array.isArray(list) && list.length) return list;
+  }
+  const raw = headers.get('set-cookie');
+  return raw ? [raw] : [];
+}
+
 async function fetchRaw(origin, headers, path) {
   const url = path && path !== '/' ? origin + path : origin + '/';
   const res = await fetch(url, { method: 'GET', headers, redirect: 'manual' });
-  const getSetCache = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
   return {
     status: res.status,
     headers: res.headers,
-    setCookies: Array.isArray(getSetCache) ? getSetCache : [],
+    setCookies: readSetCookies(res.headers),
     body: await res.text(),
   };
 }
 
-// 把 HTML 内容注入一段脚本，插入到第一个 <head> 之后（无则插到最前）。
+// 把 HTML 內容注入一段腳本，插入到第一個 <head> 之後（無則插到最前）。
 function injectIntoHead(content, snippet) {
   const i = content.toLowerCase().indexOf('<head');
   if (i !== -1) {
@@ -187,21 +229,40 @@ function injectIntoHead(content, snippet) {
   return snippet + content;
 }
 
-// 把上游响应整体透传给浏览器（保留 set-cookie 供浏览器建立会话；对 html 做注入改写）。
-function sendRaw(r, res, transformHtml) {
+// 外部鏈路是否為 HTTPS：只信任反向代理明確帶上的 x-forwarded-proto。
+function isSecureRequest(req) {
+  if (COOKIE_SECURE === 'always') return true;
+  if (COOKIE_SECURE === 'never') return false;
+  const raw = (req.headers && req.headers['x-forwarded-proto']) || '';
+  return String(raw).split(',')[0].trim().toLowerCase() === 'https';
+}
+
+function rewriteSetCookies(cookies, secure) {
+  return cookies.map((cookie) => {
+    let out = cookie;
+    if (COOKIE_SAMESITE === 'lax') out = out.replace(/SameSite=Strict/gi, 'SameSite=Lax');
+    if (secure && !/;\s*Secure\b/i.test(out)) out += '; Secure';
+    return out;
+  });
+}
+
+// 把上游響應整體透傳給瀏覽器（保留 set-cookie 供瀏覽器建立會話；對 html 做注入改寫）。
+function sendRaw(r, res, transformHtml, secure) {
   const hs = {};
+  let hasCacheControl = false;
   for (const [k, v] of r.headers) {
     const lk = k.toLowerCase();
+    if (lk === 'cache-control') hasCacheControl = true;
     if (['content-length', 'content-encoding', 'connection', 'transfer-encoding', 'keep-alive', 'upgrade', 'set-cookie'].includes(lk)) continue;
     hs[k] = v;
   }
-  hs['Cache-Control'] = hs['Cache-Control'] || 'no-store';
-  if (r.setCookies.length) hs['Set-Cookie'] = r.setCookies;
+  if (!hasCacheControl) hs['Cache-Control'] = 'no-store';
+  if (r.setCookies.length) hs['Set-Cookie'] = rewriteSetCookies(r.setCookies, !!secure);
 
   let body = r.body;
   const ct = String(r.headers.get ? r.headers.get('content-type') : '').toLowerCase();
   if (ct.includes('text/html') && transformHtml) body = transformHtml(body);
-  // 3xx/空 body 的响应（如 303 重定向）不设 Content-Type，避免误导浏览器按 HTML 处理
+  // 3xx/空 body 的響應（如 303 重定向）不設 Content-Type，避免誤導瀏覽器按 HTML 處理
   if (body && body.length) {
     hs['Content-Type'] = ct || 'text/html; charset=utf-8';
   }
@@ -211,48 +272,108 @@ function sendRaw(r, res, transformHtml) {
   return true;
 }
 
-// 处理根目录 GET：正常情况下直接转发；上游返回 401 时携带 launch token 重发一次，
-// 并把上游（重试）返回的 set-cookie 透传给浏览器，此后浏览器自动携带 cookie 通过认证。
-// 返回 true 表示已接管响应；返回 false 表示出现异常，调用方应回退到普通反向代理。
+// 重送用的網址：移除所有既有 token，再放入恰好一個當前 token。
+// 舊版用「附加」的方式，會產生 ?token=old&token=new，上游要求 tokens.length === 1，
+// 因此永遠 401——這是書籤／歷史紀錄殘留舊 token 時無法登入的直接原因。
+function buildAuthUrl(reqUrl, origin, token) {
+  const url = new URL(reqUrl, origin);
+  url.searchParams.delete(TOKEN_QUERY_KEY);
+  url.searchParams.set(TOKEN_QUERY_KEY, token);
+  return `${url.pathname}${url.search}`;
+}
+
+// 是否為「文件導航」：/index.html 或瀏覽器要求 HTML 時才導回 '/'。
+function wantsDocument(req, url) {
+  if (/\.html?$/i.test(url.pathname)) return true;
+  const accept = String((req.headers && req.headers.accept) || '');
+  return accept.includes('text/html') || accept === '' || accept === '*/*';
+}
+
+// 處理首頁 GET：正常情況直接轉發；上游 401 時攜帶 launch token 重送一次，
+// 並把上游（重試）返回的 set-cookie 透傳給瀏覽器，此後瀏覽器自動攜帶 cookie 通過認證。
+// 返回 true 表示已接管響應；返回 false 表示出現異常，呼叫方應回退到普通反向代理。
 async function serveIndex(req, res, ctx) {
   const origin = ctx.origin;
   const transformHtml = ctx.transformHtml;
+  const secure = isSecureRequest(req);
   const reqUrl = req.url || '/';
+  let url;
+  try {
+    url = new URL(reqUrl, origin);
+  } catch {
+    url = new URL('/', origin);
+  }
+
   let first;
   try {
-    first = await fetchRaw(origin, pickIndexHeaders(req), reqUrl);
+    first = await fetchRaw(origin, pickIndexHeaders(req), `${url.pathname}${url.search}`);
   } catch {
     return false;
   }
-  if (first.status === 401) {
-    const token = ensureToken();
-    if (token) {
-      console.log(`[upstream-token] 根目录首次请求返回 401，尝试携带 launch token（${maskToken(token)}）重发以换取会话 cookie`);
-      // 官方格式：把 launch token 追加进根目录 URL 的 query，换取上游会话 cookie
-      const sep = reqUrl.includes('?') ? '&' : '?';
-      const authUrl = `${reqUrl}${sep}${TOKEN_QUERY_KEY}=${encodeURIComponent(token)}`;
-      let retry;
-      // 重发是「换取全新会话」，必须剥离浏览器旧 cookie，否则上游可能因无效 cookie 直接 401
-      try { retry = await fetchRaw(origin, pickIndexHeaders(req, true), authUrl); } catch { retry = null; }
-      if (retry) {
-        const sc = retry.setCookies.length;
-        console.log(`[upstream-token] 携带 token 重发 → 上游返回 ${retry.status}，下发 ${sc} 个会话 cookie`);
-        if (retry.status === 401) {
-          console.log(`[upstream-token] 自动登录失败：携带 launch token（${maskToken(token)}）重发仍返回 401（token 可能已过期/失效，或该上游版本不支持 query token 方式）`);
-        } else if (retry.status >= 300 && retry.status < 400) {
-          const loc = String(retry.headers.get ? retry.headers.get('location') : retry.headers.location || '');
-          console.log(`[upstream-token] 自动登录成功：上游 ${retry.status} 重定向到「${loc || '/'}」，下发 ${sc} 个会话 cookie，透传后由浏览器自动跟随并携带 cookie`);
-        }
-        return sendRaw(retry, res, transformHtml);
-      }
-      console.log('[upstream-token] 携带 token 重发失败（网络异常或上游无响应），回退透传首次 401');
-    } else {
-      console.log('[upstream-token] 未获取到 launch token，跳过重发，透传首次 401');
+
+  if (first.status !== 401) {
+    if (first.status !== 200) {
+      console.log(`[upstream-token] ${url.pathname} 首次請求返回 ${first.status}（非 401），直接透傳`);
     }
-  } else if (first.status !== 200) {
-    console.log(`[upstream-token] 根目录首次请求返回 ${first.status}（非 401），直接透传`);
+    return sendRaw(first, res, transformHtml, secure);
   }
-  return sendRaw(first, res, transformHtml);
+
+  const token = ensureToken();
+
+  // 非 '/' 的首頁入口（/index.html、舊深連結）：上游只認 GET / 做 token 交換，
+  // 因此導回 '/' 完成交換；帶 __dsh_auth 標記，避免交換失敗時無限重導。
+  if (url.pathname !== '/' && !url.searchParams.has(AUTH_MARKER) && wantsDocument(req, url)) {
+    if (!token) {
+      console.log('[upstream-token] 未取得 launch token，無法引導非根入口，透傳 401');
+      return sendRaw(first, res, transformHtml, secure);
+    }
+    const target = new URL('/', origin);
+    for (const [key, value] of url.searchParams) {
+      if (key === TOKEN_QUERY_KEY || key === AUTH_MARKER) continue;
+      target.searchParams.append(key, value);
+    }
+    target.searchParams.set(TOKEN_QUERY_KEY, token);
+    target.searchParams.set(AUTH_MARKER, '1');
+    console.log(`[upstream-token] ${url.pathname} 需要授權，導向 / 換取會話（token ${maskToken(token)}）`);
+    res.writeHead(302, {
+      'cache-control': 'no-store',
+      location: `${target.pathname}${target.search}`,
+      'referrer-policy': 'no-referrer',
+    });
+    res.end();
+    return true;
+  }
+
+  if (!token) {
+    console.log('[upstream-token] 未取得 launch token，透傳上游 401');
+    return sendRaw(first, res, transformHtml, secure);
+  }
+
+  const authUrl = buildAuthUrl(reqUrl, origin, token);
+  console.log(`[upstream-token] 上游 401，攜帶 launch token（${maskToken(token)}）重送 ${url.pathname}`);
+
+  let retry = null;
+  // 重發是「換取全新會話」，必須剝離瀏覽器舊 cookie，否則上游可能因無效 cookie 直接 401
+  try { retry = await fetchRaw(origin, pickIndexHeaders(req, true), authUrl); } catch { retry = null; }
+  if (retry === null) {
+    console.log('[upstream-token] 攜帶 token 重送失敗（網路異常或上游無回應），透傳首次 401');
+    return sendRaw(first, res, transformHtml, secure);
+  }
+
+  if (retry.status === 401) {
+    // token 已失效（多半是 DSH 已重啟但本模組仍握著舊值）：立刻作廢快取，
+    // 下一個請求會依日誌 mtime 重新掃描，而不是永遠卡在 401。
+    invalidateToken();
+    console.log(`[upstream-token] 自動登入失敗：token（${maskToken(token)}）重送仍 401，已作廢快取待下次重掃`);
+    return sendRaw(retry, res, transformHtml, secure);
+  }
+
+  const cookies = retry.setCookies.length;
+  if (retry.status >= 300 && retry.status < 400) {
+    const loc = String(retry.headers.get ? retry.headers.get('location') : retry.headers.location || '');
+    console.log(`[upstream-token] 自動登入成功：上游 ${retry.status} 重定向到「${loc || '/'}」，下發 ${cookies} 個會話 cookie`);
+  }
+  return sendRaw(retry, res, transformHtml, secure);
 }
 
-module.exports = { serveIndex, ensureToken, injectIntoHead, detectDshVersion };
+module.exports = { serveIndex, ensureToken, invalidateToken, injectIntoHead, detectDshVersion };

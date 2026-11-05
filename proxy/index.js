@@ -134,9 +134,10 @@ const server = http.createServer((req, res) => {
     rejectUnauthorized(res);
     return;
   }
-  // 根目录 GET 走 serveIndex：上游(如官方 0.1.2+)返回 401 时携带 launch token 重发一次，
-  // 换取会话 cookie；返回 false（异常）则回退到普通反向代理。
-  if (req.method === 'GET' && pathname === '/') {
+  // 根目录与 /index.html 都走 serveIndex：上游(如官方 0.1.2+)返回 401 时携带 launch token
+  // 重发一次，换取会话 cookie；非 '/' 的入口由该模块导回 '/' 完成交换。
+  // 返回 false（异常）则回退到普通反向代理。
+  if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
     serveIndex(req, res, { origin: TARGET_ORIGIN, transformHtml: html => injectIntoHead(html, POLYFILL) })
       .then((handled) => {
         if (handled) return;
