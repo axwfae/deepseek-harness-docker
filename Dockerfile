@@ -108,6 +108,7 @@ RUN chmod 777 -R /app
 COPY ./Dockerfile /
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    fonts-noto-cjk \
     python3-pip \
     python3-venv \
     7zip \
