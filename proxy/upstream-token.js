@@ -21,7 +21,23 @@
 //      （上游 discussion #5362、#9096）。預設 lax，設 strict 可還原。
 //   6. 外部鏈路為 HTTPS 時（x-forwarded-proto: https）自動補 Secure，避免
 //      cookie 在 HTTPS 下缺少 Secure 而無法長時間保存。
+//
+// 2026-11 追加（根治「重啟後 / 手動啟動後永遠 401」）：
+//   launch token 只存在於 DSH 進程記憶體、只在啟動時印一行，任何「從日誌抓」
+//   的方案都會在下列情境失效：DSH 由 docker exec／手動啟動（日誌沒進檔案）、
+//   日誌裡的 token 屬於已退出的舊進程、DSH_TOKEN／DSH_TOKEN_FILE 環境變數殘留
+//   舊值（硬指定會永久覆蓋日誌打撈）。此時代理拼出的 /?token=… 必然被上游
+//   401，而且每個請求都重試無效。
+//
+//   根治方案：代理直接讀 DSH 落盤的簽名密鑰（$DSH_HOME/.credentials.yaml 的
+//   client-connection/browser-session 記錄），自己簽發 v1 會話 cookie，並把它
+//   注入每一個轉給上游的請求（HTTP 與 WebSocket）。密鑰是持久化的、跨進程
+//   重啟不變，因此完全不依賴 launch token，也不需要日誌。token 打撈保留為
+//   讀不到密鑰時的回退路徑。
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
 
 const LOG_FILE = process.env.DSH_WEB_LOG || '/app/.dsh-web.log';
 const TOKEN_FILE_AUTO = process.env.DSH_TOKEN_FILE_AUTO || '/app/.dsh-launch-token';
@@ -42,6 +58,22 @@ const COOKIE_SECURE = String(process.env.DSH_COOKIE_SECURE || 'auto').toLowerCas
 const MAX_TAIL_BYTES = 512 * 1024;
 // 抓不到 token 時，兩次掃描的最小間隔，避免每個 401 都重讀日誌。
 const SCAN_MIN_INTERVAL = 1000;
+
+// ── 代理自簽會話 cookie（主要登入路徑，不再依賴 launch token）──────────
+// DSH 的 cookie 格式（packages/client/connection/src/browser-auth.ts）：
+//   name  = "dsh-auth-" + base64url(sha256(authority))
+//   value = "v1." + base64url(JSON{version,authority,issuedAt,expiresAt})
+//           + "." + base64url(HMAC-SHA256(secret, body))
+// secret 保存在 $DSH_HOME/.credentials.yaml 的 client-connection/browser-session
+// 記錄（kind: grant, payload: {version: 1, secret: <base64url 32 bytes>}）。
+const COOKIE_PREFIX = 'dsh-auth-';
+const COOKIE_PAYLOAD_VERSION = 1;
+const CREDENTIALS_FILE = process.env.DSH_CREDENTIALS_FILE || '';
+const SESSION_MAX_AGE_DAYS = (() => {
+  const n = Number(process.env.DSH_COOKIE_MAX_AGE_DAYS);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 30;
+})();
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 let PATTERN = null;
 if (process.env.DSH_LAUNCH_TOKEN_PATTERN) {
@@ -160,6 +192,169 @@ function invalidateToken() {
   state.lastScanAt = 0;
 }
 
+// ── 簽名密鑰：候選路徑與解析 ─────────────────────────────────────────
+// 依序嘗試：顯式 DSH_CREDENTIALS_FILE → $DSH_HOME → 目前使用者家目錄 →
+// 映像內常見的 /home/node/.dsh、/root/.dsh（README 舊寫法）。
+function credentialCandidates() {
+  const list = [];
+  if (CREDENTIALS_FILE) list.push(CREDENTIALS_FILE);
+  const homes = [];
+  if (process.env.DSH_HOME) homes.push(process.env.DSH_HOME);
+  try { homes.push(path.join(os.homedir(), '.dsh')); } catch {}
+  homes.push('/home/node/.dsh', '/root/.dsh');
+  for (const home of homes) if (home) list.push(path.join(home, '.credentials.yaml'));
+  return [...new Set(list)];
+}
+
+function base64Url(buf) {
+  return Buffer.from(buf).toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// 從 YAML 文本中取出 browser-session 記錄的 secret（不引入 yaml 相依）。
+// 只認 `client-connection/browser-session:` 區塊，避免誤抓 refs 或其他記錄；
+// 值必須是 32 bytes 的 base64url（43 字元）。
+function extractSecret(text) {
+  const lines = String(text).split(/\r?\n/);
+  const RECORD_KEY = /^[ \t]*(['"]?)client-connection\/browser-session\1[ \t]*:(?:[ \t]|$)/;
+  let recordIndent = -1;
+  for (const line of lines) {
+    if (!line.trim() || line.trimStart().startsWith('#')) continue;
+    const indent = line.match(/^[ \t]*/)[0].length;
+    if (recordIndent !== -1 && indent <= recordIndent) recordIndent = -1;
+    if (recordIndent === -1) {
+      if (RECORD_KEY.test(line)) recordIndent = indent;
+      continue;
+    }
+    const secret = /^[ \t]+secret[ \t]*:[ \t]*(.+?)[ \t]*$/.exec(line);
+    if (!secret) continue;
+    let value = secret[1];
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (/^[A-Za-z0-9_-]{43}$/.test(value)) return value;
+  }
+  return null;
+}
+
+// 每個候選檔案的快取：mtime/size 一變就重讀。這裡刻意不做「N 秒 TTL」——
+// 密鑰輪替（資料卷重建、刪除後重建）時，下一個請求就要立刻用新密鑰，
+// 否則會出現短暫 401。stat 的成本遠低於一次反向代理。
+const secretFiles = new Map(); // file -> { mtimeMs, size, secret }
+let secretLogState = { path: null, warnedAt: 0 };
+
+// 讀取所有可用密鑰（依檔案 mtime 新→舊排序）。
+function readSecrets() {
+  const now = Date.now();
+  const entries = [];
+  for (const file of credentialCandidates()) {
+    let st;
+    try {
+      st = fs.statSync(file);
+    } catch {
+      secretFiles.delete(file);
+      continue;
+    }
+    const cached = secretFiles.get(file);
+    let secret;
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+      secret = cached.secret;
+    } else {
+      try {
+        secret = extractSecret(fs.readFileSync(file, 'utf8'));
+      } catch {
+        secret = null;
+      }
+      secretFiles.set(file, { mtimeMs: st.mtimeMs, size: st.size, secret });
+      if (secret) {
+        console.log(`[upstream-token] 讀取 DSH 簽名密鑰（${file}）：使用代理自簽會話 cookie${cached && cached.secret && cached.secret !== secret ? '（密鑰已輪替，重新簽發）' : ''}`);
+      }
+    }
+    if (secret) entries.push({ file, mtimeMs: st.mtimeMs, secret });
+  }
+  entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const first = entries[0];
+  if (first && first.file !== secretLogState.path) {
+    secretLogState.path = first.file;
+  } else if (!first) {
+    secretLogState.path = null;
+    // 讀不到密鑰就只能回退 launch token；每分鐘提示一次，方便排查掛載/權限問題。
+    if (now - secretLogState.warnedAt > 60000) {
+      secretLogState.warnedAt = now;
+      console.warn(`[upstream-token] 找不到可讀的 DSH 簽名密鑰（候選：${credentialCandidates().join(', ')}）；改用 launch token 回退路徑`);
+    }
+  }
+  return entries;
+}
+
+// 由密鑰簽出一個 v1 會話 cookie；authority 必須與上游看到的 Host 完全一致
+// （代理以 changeOrigin 轉發，因此固定是 127.0.0.1:<DSH_PORT>）。
+function signSessionCookie(authority, secretB64) {
+  const secret = Buffer.from(secretB64.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+  if (secret.length !== 32) return null;
+  const issuedAt = Date.now();
+  const expiresAt = issuedAt + SESSION_MAX_AGE_DAYS * DAY_MS;
+  const body = base64Url(Buffer.from(JSON.stringify({
+    version: COOKIE_PAYLOAD_VERSION,
+    authority,
+    issuedAt,
+    expiresAt,
+  }), 'utf8'));
+  const signature = base64Url(crypto.createHmac('sha256', secret).update(body).digest());
+  return {
+    name: COOKIE_PREFIX + base64Url(crypto.createHash('sha256').update(authority).digest()),
+    value: `v${COOKIE_PAYLOAD_VERSION}.${body}.${signature}`,
+    expiresAt,
+    maxAge: SESSION_MAX_AGE_DAYS * 24 * 60 * 60,
+  };
+}
+
+// 目前可用的所有會話 cookie（不同 DSH_HOME 可能各有一把密鑰）。
+function sessionCookies(authority) {
+  const out = [];
+  const seen = new Set();
+  for (const entry of readSecrets()) {
+    if (seen.has(entry.secret)) continue;
+    seen.add(entry.secret);
+    const cookie = signSessionCookie(authority, entry.secret);
+    if (cookie) out.push(cookie);
+  }
+  return out;
+}
+
+// 用代理簽發的 cookie 取代瀏覽器帶來的同名 cookie（上游只看第一個同名值），
+// 其餘 cookie 原樣保留。
+function mergeCookieHeader(rawHeader, cookie) {
+  const kept = String(rawHeader || '')
+    .split(';')
+    .map((segment) => segment.trim())
+    .filter((segment) => {
+      if (!segment) return false;
+      const at = segment.indexOf('=');
+      return at === -1 || segment.slice(0, at).trim() !== cookie.name;
+    });
+  kept.push(`${cookie.name}=${cookie.value}`);
+  return kept.join('; ');
+}
+
+// 注入上游請求：HTTP 與 WebSocket 都靠這一步通過 DSH 的 cookie 驗證。
+function applyUpstreamAuth(req, authority) {
+  if (!req || !req.headers) return false;
+  const cookies = sessionCookies(authority);
+  if (!cookies.length) return false;
+  req.headers.cookie = mergeCookieHeader(req.headers.cookie, cookies[0]);
+  return true;
+}
+
+// 給瀏覽器的 Set-Cookie（讓瀏覽器也持有有效會話；代理仍會逐請求注入）。
+function formatSetCookie(cookie, secure) {
+  const sameSite = COOKIE_SAMESITE === 'strict' ? 'Strict' : 'Lax';
+  let out = `${cookie.name}=${cookie.value}; Max-Age=${cookie.maxAge}; Path=/; `
+    + `Expires=${new Date(cookie.expiresAt).toUTCString()}; HttpOnly; SameSite=${sameSite}`;
+  if (secure) out += '; Secure';
+  return out;
+}
+
 // 版本探測：供診斷與後續按版本細化判斷；一般不需要
 const VERSION_PATHS = [
   process.env.DSH_VERSION,
@@ -247,7 +442,8 @@ function rewriteSetCookies(cookies, secure) {
 }
 
 // 把上游響應整體透傳給瀏覽器（保留 set-cookie 供瀏覽器建立會話；對 html 做注入改寫）。
-function sendRaw(r, res, transformHtml, secure) {
+// extraCookies 是代理自己簽發的會話 cookie（字符串形式），追加在透傳的 Set-Cookie 之後。
+function sendRaw(r, res, transformHtml, secure, extraCookies) {
   const hs = {};
   let hasCacheControl = false;
   for (const [k, v] of r.headers) {
@@ -257,7 +453,9 @@ function sendRaw(r, res, transformHtml, secure) {
     hs[k] = v;
   }
   if (!hasCacheControl) hs['Cache-Control'] = 'no-store';
-  if (r.setCookies.length) hs['Set-Cookie'] = rewriteSetCookies(r.setCookies, !!secure);
+  const cookies = rewriteSetCookies(r.setCookies, !!secure);
+  if (extraCookies && extraCookies.length) cookies.push(...extraCookies);
+  if (cookies.length) hs['Set-Cookie'] = cookies;
 
   let body = r.body;
   const ct = String(r.headers.get ? r.headers.get('content-type') : '').toLowerCase();
@@ -289,13 +487,15 @@ function wantsDocument(req, url) {
   return accept.includes('text/html') || accept === '' || accept === '*/*';
 }
 
-// 處理首頁 GET：正常情況直接轉發；上游 401 時攜帶 launch token 重送一次，
-// 並把上游（重試）返回的 set-cookie 透傳給瀏覽器，此後瀏覽器自動攜帶 cookie 通過認證。
+// 處理首頁 GET：優先帶上代理自簽的會話 cookie（不用 token、不受重啟影響）；
+// 若密鑰不可用，回退到「帶 launch token 重送」的老路徑。
 // 返回 true 表示已接管響應；返回 false 表示出現異常，呼叫方應回退到普通反向代理。
 async function serveIndex(req, res, ctx) {
   const origin = ctx.origin;
   const transformHtml = ctx.transformHtml;
   const secure = isSecureRequest(req);
+  const authority = ctx.authority || new URL(origin).host;
+  const session = sessionCookies(authority);
   const reqUrl = req.url || '/';
   let url;
   try {
@@ -304,9 +504,14 @@ async function serveIndex(req, res, ctx) {
     url = new URL('/', origin);
   }
 
+  // 首次請求：帶上代理自簽 cookie（呼叫方通常已注入，這裡再保證一次，
+  // 讓 serveIndex 單獨被呼叫時也成立）。
+  const firstHeaders = pickIndexHeaders(req);
+  if (session.length) firstHeaders.cookie = mergeCookieHeader(req.headers.cookie, session[0]);
+
   let first;
   try {
-    first = await fetchRaw(origin, pickIndexHeaders(req), `${url.pathname}${url.search}`);
+    first = await fetchRaw(origin, firstHeaders, `${url.pathname}${url.search}`);
   } catch {
     return false;
   }
@@ -315,7 +520,28 @@ async function serveIndex(req, res, ctx) {
     if (first.status !== 200) {
       console.log(`[upstream-token] ${url.pathname} 首次請求返回 ${first.status}（非 401），直接透傳`);
     }
-    return sendRaw(first, res, transformHtml, secure);
+    return sendRaw(first, res, transformHtml, secure,
+      session.length ? [formatSetCookie(session[0], secure)] : []);
+  }
+
+  // 其他候選密鑰（不同 DSH_HOME）：逐一嘗試，全部失敗才回退 launch token。
+  for (let i = 1; i < session.length; i++) {
+    let retry = null;
+    try {
+      const headers = pickIndexHeaders(req);
+      headers.cookie = mergeCookieHeader(req.headers.cookie, session[i]);
+      retry = await fetchRaw(origin, headers, `${url.pathname}${url.search}`);
+    } catch {
+      retry = null;
+    }
+    if (retry && retry.status !== 401) {
+      console.log(`[upstream-token] 改用另一把簽名密鑰的會話 cookie 成功（${url.pathname}）`);
+      return sendRaw(retry, res, transformHtml, secure, [formatSetCookie(session[i], secure)]);
+    }
+  }
+
+  if (session.length) {
+    console.log(`[upstream-token] 自簽會話 cookie 被上游拒絕（${url.pathname}），回退 launch token`);
   }
 
   const token = ensureToken();
@@ -376,4 +602,7 @@ async function serveIndex(req, res, ctx) {
   return sendRaw(retry, res, transformHtml, secure);
 }
 
-module.exports = { serveIndex, ensureToken, invalidateToken, injectIntoHead, detectDshVersion };
+module.exports = {
+  serveIndex, ensureToken, invalidateToken, injectIntoHead, detectDshVersion,
+  applyUpstreamAuth, sessionCookies, extractSecret,
+};

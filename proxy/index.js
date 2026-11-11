@@ -1,7 +1,7 @@
 const http = require('http');
 const httpProxy = require('http-proxy');
 const crypto = require('crypto');
-const { serveIndex, injectIntoHead } = require('./upstream-token.js');
+const { serveIndex, injectIntoHead, applyUpstreamAuth } = require('./upstream-token.js');
 const { attachBodyTransform } = require('./compression.js');
 
 // 源端口（DSH 监听端口，默认 3079）与代理端口（代理对外监听端口，默认 3080）。
@@ -128,25 +128,40 @@ function alignOrigin(req) {
   if (req.headers.origin) req.headers.origin = TARGET_ORIGIN;
 }
 
+// 上游（changeOrigin）看到的 Host 固定為目標位址；cookie 的 authority 與名稱都由它決定。
+const UPSTREAM_AUTHORITY = new URL(TARGET_ORIGIN).host;
+
+// 每個轉給 DSH 的請求（HTTP 與 WebSocket）都注入代理自簽的會話 cookie：
+// 瀏覽器不需要持有有效 cookie，也不再依賴 launch token／日誌，DSH 重啟、
+// 手動啟動、token 過期都不影響登入。
+function prepareUpstream(req) {
+  alignOrigin(req);
+  applyUpstreamAuth(req, UPSTREAM_AUTHORITY);
+}
+
 const server = http.createServer((req, res) => {
   const pathname = new URL(req.url ?? '/', 'http://proxy').pathname;
   if (!PUBLIC_PATHS.has(pathname) && !checkAuth(req)) {
     rejectUnauthorized(res);
     return;
   }
-  // 根目录与 /index.html 都走 serveIndex：上游(如官方 0.1.2+)返回 401 时携带 launch token
-  // 重发一次，换取会话 cookie；非 '/' 的入口由该模块导回 '/' 完成交换。
+  // 根目录与 /index.html 都走 serveIndex：优先用代理自签 cookie 直接取得会话；
+  // 密钥不可用时回退到 launch token 交换，非 '/' 的入口由该模块导回 '/' 完成交换。
   // 返回 false（异常）则回退到普通反向代理。
   if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
-    serveIndex(req, res, { origin: TARGET_ORIGIN, transformHtml: html => injectIntoHead(html, POLYFILL) })
+    prepareUpstream(req);
+    serveIndex(req, res, {
+      origin: TARGET_ORIGIN,
+      authority: UPSTREAM_AUTHORITY,
+      transformHtml: html => injectIntoHead(html, POLYFILL),
+    })
       .then((handled) => {
         if (handled) return;
-        alignOrigin(req);
         proxy.web(req, res);
       });
     return;
   }
-  alignOrigin(req);
+  prepareUpstream(req);
   proxy.web(req, res);
 });
 
@@ -155,7 +170,7 @@ server.on('upgrade', (req, socket, head) => {
     rejectUpgrade(socket);
     return;
   }
-  alignOrigin(req);
+  prepareUpstream(req);
   proxy.ws(req, socket, head);
 });
 
