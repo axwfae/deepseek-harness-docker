@@ -17,7 +17,7 @@ const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const httpProxy = require('http-proxy');
 const crypto = require('crypto');
-const { serveIndex, injectIntoHead } = require('../proxy/upstream-token.js');
+const { serveIndex, injectIntoHead, applyUpstreamAuth } = require('../proxy/upstream-token.js');
 const { attachBodyTransform } = require('../proxy/compression.js');
 
 // ── 端口与环境 ────────────────────────────────────────────────
@@ -351,6 +351,16 @@ function alignOrigin(req) {
   // proxyRes 的压缩兼容管线都会「解压 → 改写 → 重压」，保留带宽收益。
 }
 
+// 上游（changeOrigin）看到的 Host 固定為目標位址；cookie 的 authority 與名稱都由它決定。
+const UPSTREAM_AUTHORITY = new URL(TARGET_ORIGIN).host;
+
+// 每個轉給 DSH 的請求（HTTP 與 WebSocket）都注入代理自簽的會話 cookie，
+// 不依賴 launch token／日誌，DSH 重啟或切換版本後仍可自動登入。
+function prepareUpstream(req) {
+  alignOrigin(req);
+  applyUpstreamAuth(req, UPSTREAM_AUTHORITY);
+}
+
 // ── 管理员页面 ───────────────────────────────────────────────
 let adminHtmlCache = null;
 function serveAdmin(res) {
@@ -448,13 +458,18 @@ const server = http.createServer(async (req, res) => {
 
   // 其余路径：DSH 就绪则反代，否则跳到管理员页
   if (dshReady) {
-    // 根目录与 /index.html 都走 serveIndex：上游(如官方 0.1.2+)返回 401 时携带 launch token
-    // 重发一次；非 '/' 的入口由该模块导回 '/' 完成交换
+    // 根目录与 /index.html 都走 serveIndex：优先用代理自签 cookie 直接取得会话；
+    // 密钥不可用时回退到 launch token 交换；非 '/' 的入口由该模块导回 '/' 完成交换。
     if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
-      const handled = await serveIndex(req, res, { origin: TARGET_ORIGIN, transformHtml: html => injectIntoHead(html, HTML_INJECT) });
+      prepareUpstream(req);
+      const handled = await serveIndex(req, res, {
+        origin: TARGET_ORIGIN,
+        authority: UPSTREAM_AUTHORITY,
+        transformHtml: html => injectIntoHead(html, HTML_INJECT),
+      });
       if (handled) return;
     }
-    alignOrigin(req);
+    prepareUpstream(req);
     return proxy.web(req, res);
   }
   res.writeHead(302, { Location: '/__admin/' });
@@ -467,7 +482,7 @@ server.on('upgrade', (req, socket, head) => {
     socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
     return;
   }
-  alignOrigin(req);
+  prepareUpstream(req);
   proxy.ws(req, socket, head);
 });
 
