@@ -23,8 +23,8 @@ DSH_PORT="${DSH_PORT:-3079}"
 PROXY_PORT="${PROXY_PORT:-3080}"
 
 # ── 1. 启动 DSH（默认监听 127.0.0.1:3080）────────────────────────────
-# DSH 输出需同时落盘到 /app/.dsh-web.log：代理的 upstream-token.js 靠读该文件
-# 打捞 launch token（用于根目录 401 时重发换会话 cookie）。用重定向直写文件
+# DSH 输出需同时落盘到 /app/.dsh-web.log：代理的 upstream-token.js 在无法读取
+# 签名密钥时，靠读该文件打捞 launch token（回退路径）。用重定向直写文件
 # （立即落盘、无管道缓冲延迟），再用 tail -f 转发到容器输出保持可见。
 # 注意：不能用 `| tee` 管道——那样 $! 捕获的是 tee 的 PID，cleanup 会杀错进程。
 

@@ -1,7 +1,89 @@
 # DSH Docker 登入修正：`upstream-token.js`
 
 適用於 `axwfae/deepseek-harness-docker`（`@deepseek-ai/dsh` 0.2.x，含 admin 變體）。
-修正日期：2026-11-05。
+修正日期：2026-11-05；**2026-11-11 追加「自簽 cookie」根治方案（見 §0）**。
+
+---
+
+## 0. 2026-11-11 追加：不再依賴 launch token
+
+### 0.1 仍會 401 的真正原因
+
+§2 的模型決定了 launch token **只存在於 DSH 進程記憶體**、只在啟動時印一行。舊版代理從
+`/app/.dsh-web.log` 打撈 token；一旦打撈到的值不是「當前進程」的 token，`GET /?token=…`
+就永遠 401，且每次重試都用同一個錯值。實測線上症狀：
+
+```sh
+curl -sS -i 'http://<主機>:53080/index.html'   # 302 → /?token=<43字元>
+curl -sS -i 'http://<主機>:53080/?token=<同上>'  # 直接 401（token 無效，不是交換機制壞）
+```
+
+常見成因：
+
+| 成因 | 說明 |
+|---|---|
+| DSH 被 `docker exec`／手動重啟 | 新的 `dsh web:` 行沒寫進代理讀的日誌檔，日誌裡只剩舊進程的 token |
+| 舊進程 token 留在日誌尾部 | 重啟競態、切換版本失敗留下的進程先印了 token 後退出 |
+| `DSH_TOKEN`／`DSH_TOKEN_FILE` 殘留 | 硬指定優先於日誌，DSH 重啟後永久失效 |
+
+### 0.2 新機制：代理自簽 DSH 會話 cookie
+
+DSH 的 cookie 簽名密鑰持久化在 `$DSH_HOME/.credentials.yaml`：
+
+```yaml
+version: 1
+records:
+  client-connection/browser-session:
+    kind: grant
+    payload:
+      version: 1
+      secret: <base64url 32 bytes>
+```
+
+代理（與 DSH 同一容器、同一使用者）讀出 `secret`，照上游格式自行簽發：
+
+- cookie 名稱：`dsh-auth-` + `base64url(sha256(authority))`，authority = 上游看到的 Host
+  （代理 `changeOrigin`，固定 `127.0.0.1:<DSH_PORT>`）；
+- cookie 值：`v1.<base64url(JSON{version,authority,issuedAt,expiresAt})>.<base64url(HMAC-SHA256)>`。
+
+然後把這個 cookie **注入每一個轉給 DSH 的請求**（HTTP 與 WebSocket），並在首頁回應時
+`Set-Cookie` 給瀏覽器。效果：
+
+- 不需要 launch token、不需要讀日誌；
+- DSH 重啟／切換版本（密鑰不變）後使用者的瀏覽器**不會**再被踢回 401；
+- 瀏覽器裡的舊／無效 cookie 會被代理剝離替換，不再出現「舊 cookie 導致 401」；
+- 密鑰被換掉（資料卷重建）時，代理在 1 秒內自動換用新密鑰並重新簽發。
+
+讀不到密鑰（路徑不對、權限不足、檔案尚未生成）時，才回退到 §3 的 launch token 流程。
+
+### 0.3 新環境變數
+
+| 變數 | 預設 | 說明 |
+|---|---|---|
+| `DSH_CREDENTIALS_FILE` | 空 | 明確指定 `.credentials.yaml`；不設則依序探測 `$DSH_HOME/.credentials.yaml`、`~/.dsh/…`、`/home/node/.dsh/…`、`/root/.dsh/…` |
+| `DSH_COOKIE_MAX_AGE_DAYS` | `30` | 自簽 cookie 有效期；必須 ≤ DSH 的 `cookieMaxAgeDays`（預設 30），否則上游會拒收 |
+
+### 0.4 驗證
+
+```sh
+# 容器內：確認密鑰存在且可讀
+docker exec dsh-harness sh -c 'ls -l "$HOME/.dsh/.credentials.yaml" && grep -c "browser-session" "$HOME/.dsh/.credentials.yaml"'
+
+# 外部：根目錄應直接 200（並帶 Set-Cookie），不再 401
+curl -sS -o /dev/null -w '%{http_code}\n' http://<主機>:3080/
+curl -sS -i http://<主機>:3080/ | grep -i 'set-cookie'
+
+# 容器日誌應出現（而不是「自動登入失敗」）
+docker logs dsh-harness 2>&1 | grep '簽名密鑰'
+```
+
+排錯：
+
+| 日誌／現象 | 判定 |
+|---|---|
+| `找不到可讀的 DSH 簽名密鑰` | 路徑或權限問題；用 `DSH_CREDENTIALS_FILE` 明確指定 |
+| `自簽會話 cookie 被上游拒絕` | `DSH_COOKIE_MAX_AGE_DAYS` 大於 DSH `cookieMaxAgeDays`，或密鑰不屬於該 DSH（多個 DSH_HOME） |
+| 仍見 `自動登入失敗 … 重送仍 401` | 密鑰不可用且日誌 token 也是舊的；先解決密鑰 |
 
 ---
 
@@ -131,7 +213,7 @@ docker run -d --name dsh-harness -p 3080:3080 \
 | **B. 改 DSH 本體** | 在 image 建置時改 `lib/index.js`，讓 `authorizeIndex`／`isAuthenticated`／`authenticateApi` 直接放行 | **不建議**：等於把可執行工具的完整 Host API 開放給任何能連到 port 的人；每次升級 DSH 都會覆蓋；需同時改 index、`/api`、WebSocket 三處 |
 | **C. 代理自簽 cookie（可加）** | 代理讀 `$DSH_HOME/.credentials.yaml` 的簽名密鑰，自行簽發 `v1` cookie | 代理持有簽名密鑰，且依賴上游 cookie 格式；格式改版時需同步。可作為「完全不依賴日誌」的最後手段 |
 
-結論：**沒有可以直接關閉 cookie/token 的官方設定**；日常也不需要關，因為 token 只存在於「代理 ↔ DSH」之間。若你要的是「代理連日誌都不用讀」，只能走方案 C，需要另外實作。
+結論：**沒有可以直接關閉 cookie/token 的官方設定**；日常也不需要關，因為 token 只存在於「代理 ↔ DSH」之間。方案 C 已於 2026-11-11 實作為預設路徑（見 §0），因此連日誌都不再需要讀。
 
 ---
 
@@ -202,7 +284,9 @@ docker logs -f dsh-harness | grep upstream-token                   # 應見「�
 
 ## 8. 已知限制
 
-- 依賴「從日誌抓 token」仍是 screen-scraping：日誌被截斷、輪替、或格式改變時會失效（會自動重試並記錄日誌）。
+- 依賴「從日誌抓 token」仍是 screen-scraping：日誌被截斷、輪替、或格式改變時會失效（會自動重試並記錄日誌）。**自 2026-11-11 起這只是回退路徑**，預設改用 §0 的自簽 cookie（讀 `.credentials.yaml` 的簽名密鑰）。
+- 自簽 cookie 依賴上游的 cookie 格式（`v1.<body>.<hmac>`、名稱 `dsh-auth-<sha256(authority)>`）；DSH 改版時需同步。已核對 0.1.7、0.2.0、0.2.1、0.2.2 格式一致。
+- 自簽 cookie 的 authority 綁定代理轉發的 Host（`127.0.0.1:<DSH_PORT>`），因此代理不能再對 DSH 使用不同的 Host 改寫方式。
 - 所有完成交換的瀏覽器共用同一組 Host API 權限；人員隔離請靠 Basic Auth／SSO／VPN，並限制 3080 的來源。
 - `SameSite=Lax` 是代理層改寫，不是上游修正；上游仍硬編碼 `Strict`（`browser-auth.ts`）。
 - 上游建議（可提交 discussion）：新增 `cookieSameSite: 'strict' | 'lax'` 設定，或提供 supervisor 取得當前 process token 的官方管道（例如 `--token-file`），取代日誌抓取。

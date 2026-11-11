@@ -76,14 +76,37 @@ dsh web authentication required; reopen the URL printed by dsh web.
 行为细节：原始 query 参数会保留（`/index.html?session=abc` → `/?session=abc&token=…&__dsh_auth=1`）；
 已带 `__dsh_auth` 仍 401 时直接透传，不再重导；`Cache-Control` 只在缺失时补 `no-store`，不再重复输出。
 
-新增环境变量：
+### 2026-11 根治：改用 DSH 落盘的签名密钥自签会话 cookie
+
+上面的六项修正仍然依赖「从日志里打捞 launch token」，而 launch token 只存在于 DSH 进程内存、
+只在启动时打印一行。以下情况会让打捞到的 token **永久失效**，表现为页面再次只剩那行 401，
+且每次重试都失败：
+
+- DSH 由 `docker exec`／手动启动，启动行没写进 `/app/.dsh-web.log`；
+- 日志里的最后一个 token 属于已经退出的旧进程（重启竞态、切换版本失败留下的进程）；
+- 容器里残留了旧值的 `DSH_TOKEN`／`DSH_TOKEN_FILE`，硬指定 token 会永久覆盖日志打捞。
+
+现在的做法：代理直接读取 DSH 持久化的签名密钥
+（`$DSH_HOME/.credentials.yaml` 的 `client-connection/browser-session` 记录），
+按 DSH 的格式自行签发 `dsh-auth-…` 会话 cookie，并把它注入**每一个**转发给 DSH 的请求
+（HTTP 与 WebSocket），同时下发给浏览器。签名密钥跨进程重启、切换版本都不变，
+因此不再依赖 launch token，也不受 `SameSite`／旧 cookie／主机名影响。
+读不到密钥（路径或权限问题）时才回退到原来的 launch token 流程。
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `DSH_CREDENTIALS_FILE` | 空 | 显式指定 `.credentials.yaml` 路径；不设则自动探测 `$DSH_HOME`、`~/.dsh`、`/home/node/.dsh`、`/root/.dsh` |
+| `DSH_COOKIE_MAX_AGE_DAYS` | `30` | 自签会话 cookie 的有效期；必须 **≤** DSH 的 `cookieMaxAgeDays`（默认 30） |
+
+修正后用户打开 `http://<主机>:3080/` **不需要看到或粘贴任何 token**，也不需要浏览器里存在旧 cookie。
+
+新增环境变量（cookie 属性改写，保留给反代/跨站场景）：
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `DSH_COOKIE_SAMESITE` | `lax` | `lax`：把上游 `SameSite=Strict` 改写为 `Lax`；`strict`：保持上游原样 |
 | `DSH_COOKIE_SECURE` | `auto` | `auto`：请求带 `x-forwarded-proto: https` 时补 `Secure`；`always` / `never` 强制开关 |
 
-修正后用户打开 `http://<主机>:3080/` **不需要看到或粘贴任何 token**：代理会自动用启动 token 换取会话 cookie。
 token 只存在于「代理 ↔ DSH」之间，因此日常也不需要关闭认证；上游没有提供关闭开关。
 
 完整说明（认证模型、全部环境变量、能否关闭 cookie/token、验证与排错）见 **[LOGIN-FIX.md](LOGIN-FIX.md)**。
@@ -95,8 +118,8 @@ deepseek-harness/
 ├── Dockerfile            # node:24-slim + 安装 DSH + 代理（支持 DEV_TOOLS 构建参数；admin 变体预装最新 DSH）
 ├── entrypoint.sh         # 先启动 DSH，等待就绪，再启动代理（检测到 admin 变体标记则改走管理服务）
 ├── proxy/
-│   ├── index.js          # 代理（转发 + polyfill 注入 + Origin 对齐 + Basic Auth）
-│   ├── upstream-token.js # 上游 401 时用启动 token 自动换取会话 cookie（登录修正）
+│   ├── index.js          # 代理（转发 + polyfill 注入 + Origin 对齐 + Basic Auth + 会话 cookie 注入）
+│   ├── upstream-token.js # 自签 DSH 会话 cookie（主路径）；launch token 打捞（回退路径）
 │   └── package.json
 ├── manager/              # admin 变体专用：页面安装/切换 DSH 版本、配置 npm 源、托管 DSH 进程
 │   ├── index.js

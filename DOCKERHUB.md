@@ -79,7 +79,13 @@ dsh web authentication required; reopen the URL printed by dsh web.
 
 修正后：**用户只需打开 `http://<主机>:3080/`，不需要看到或粘贴任何 token**。token 只存在于「代理 ↔ DSH」之间，因此日常也不需要关闭认证；上游没有提供关闭认证的开关。
 
-新增两个环境变量（详见下方配置表）：`DSH_COOKIE_SAMESITE`（默认 `lax`）、`DSH_COOKIE_SECURE`（默认 `auto`）。
+### 2026-11 根治：自签会话 cookie（不再依赖启动 token）
+
+启动 token 只在内存里、只在启动时打印一行，因此「从日志打捞」在下列情况下会永久失效：DSH 被 `docker exec`/手动启动、日志里的 token 属于已退出的旧进程、容器里残留旧值的 `DSH_TOKEN`。症状与上面完全相同，只是每次重试都失败。
+
+现在代理改为直接读取 DSH 持久化的签名密钥（`$DSH_HOME/.credentials.yaml` 的 `client-connection/browser-session`），自行签发 `dsh-auth-…` 会话 cookie 并注入每个转发给 DSH 的请求（HTTP 与 WebSocket），同时下发给浏览器。签名密钥跨重启、切换版本不变，所以 DSH 重启不会再让用户看到 401；浏览器旧 cookie 也会被代理替换掉。读不到密钥时才回退到启动 token 流程。
+
+新增四个环境变量（详见配置表）：`DSH_CREDENTIALS_FILE`（明确指定 `.credentials.yaml`）、`DSH_COOKIE_MAX_AGE_DAYS`（默认 `30`，须 ≤ DSH 的 `cookieMaxAgeDays`）、`DSH_COOKIE_SAMESITE`（默认 `lax`）、`DSH_COOKIE_SECURE`（默认 `auto`）。
 
 完整说明（认证模型、全部环境变量、能否关闭 cookie/token、验证与排查）见
 [LOGIN-FIX.md](https://github.com/axwfae/deepseek-harness-docker/blob/main/LOGIN-FIX.md)。
@@ -124,6 +130,8 @@ dsh web authentication required; reopen the URL printed by dsh web.
 | `PROXY_PASSWORD` | Basic Auth 密码（可选） | 未设置 |
 | `DSH_COOKIE_SAMESITE` | `lax`：把上游 `SameSite=Strict` 改写为 `Lax`（修手机 App／跨站打开的 401）；`strict`：保持上游原样 | `lax` |
 | `DSH_COOKIE_SECURE` | `auto`：请求带 `x-forwarded-proto: https` 时补 `Secure`；`always` / `never` 强制开关 | `auto` |
+| `DSH_CREDENTIALS_FILE` | 明确指定 DSH 的 `.credentials.yaml`（自签发会话 cookie 用）；不设则自动探测 `$DSH_HOME` 等路径 | 未设置 |
+| `DSH_COOKIE_MAX_AGE_DAYS` | 自签发会话 cookie 的有效期（须 ≤ DSH 的 `cookieMaxAgeDays`） | `30` |
 | `DSH_WEB_LOG` | 代理抓取启动 token 的 DSH 日志路径 | `/app/.dsh-web.log` |
 | `DSH_TOKEN` | 手动指定启动 token，优先于日志（DSH 重启后同样失效） | 未设置 |
 | `DSH_TOKEN_FILE` | 从文件读取启动 token（优先于日志、低于 `DSH_TOKEN`） | 未设置 |
