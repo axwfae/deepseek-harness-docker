@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Lightpanda CDP 浏览器",
+    "description": "透过 CDP 驱动远端的 Lightpanda 无头浏览器：开页、读成 markdown、列出可交互元素、点击或填表、截 PNG、执行 JavaScript。分页存活于同一条常驻连接内，target id 可跨调用沿用。需要可达的 Lightpanda 服务（默认 lightpanda:9222）与 loopback 形式的 Host 头，配置已预置。"
+  }
+}

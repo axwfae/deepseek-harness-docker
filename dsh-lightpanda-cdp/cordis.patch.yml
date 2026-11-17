@@ -1,0 +1,21 @@
+# Mount the Lightpanda CDP tools (dsh/index.js via the package "." export).
+#
+# These are the built-in defaults only. The live endpoint resolves in this
+# order, most specific first:
+#   1. per-call tool arguments (host / port / hostHeader)
+#   2. environment: LIGHTPANDA_CDP_URL | LIGHTPANDA_CDP_HOST / _PORT / _HOST_HEADER
+#   3. the settings file written by the lp_config tool:
+#        $DSH_PROFILE_DIR/plugins-data/lightpanda-cdp/config.json
+#   4. this config block
+#   5. the code default lightpanda:9222 with Host 127.0.0.1
+#
+# Use lp_config({ action: "set", host, port }) for a change without a restart,
+# or edit this block for a permanent default. hostHeader must stay loopback
+# (127.0.0.1); Lightpanda only checks the hostname, so any port passes.
+- insert:
+    - id: lightpanda-cdp
+      name: dsh-lightpanda-cdp
+      config:
+        host: lightpanda
+        port: 9222
+        timeoutMs: 30000

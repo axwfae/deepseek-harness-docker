@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Lightpanda CDP",
+    "description": "Drives a remote Lightpanda headless browser over CDP: open a page, read it as markdown, list interactive elements, click or fill, capture a PNG, and evaluate JavaScript. Tabs live inside one warm connection, so target ids stay usable between calls. Needs a reachable Lightpanda server (default lightpanda:9222) and a loopback Host header, which the config supplies."
+  }
+}

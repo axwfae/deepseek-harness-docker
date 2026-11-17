@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Lightpanda CDP">
+  <rect width="64" height="64" rx="14" fill="#1F2430"/>
+  <circle cx="18" cy="20" r="6" fill="#E9EDF5"/>
+  <circle cx="34" cy="20" r="6" fill="#E9EDF5"/>
+  <path d="M10 38c0-9 7-15 16-15s16 6 16 15c0 8-7 13-16 13S10 46 10 38z" fill="#E9EDF5"/>
+  <ellipse cx="19" cy="36" rx="3" ry="3.6" fill="#1F2430"/>
+  <ellipse cx="33" cy="36" rx="3" ry="3.6" fill="#1F2430"/>
+  <ellipse cx="26" cy="43" rx="2.6" ry="2" fill="#1F2430"/>
+  <g stroke="#5EE0C0" stroke-width="2.4" stroke-linecap="round" fill="none">
+    <path d="M44 47V31"/>
+    <path d="M44 31l8-8"/>
+    <path d="M44 39h8"/>
+  </g>
+  <g fill="#5EE0C0">
+    <circle cx="44" cy="47" r="3"/>
+    <circle cx="54" cy="21" r="3.2"/>
+    <circle cx="54" cy="39" r="3.2"/>
+  </g>
+</svg>
