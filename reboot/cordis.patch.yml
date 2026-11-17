@@ -1,0 +1,8 @@
+# dsh bundle patch：把本插件插入 profile 的层栈。
+# 作为 bundle 被 dsh.profile.bundles 引用时自动生效；
+# 若只想在用户 patch 层启用，可把下面的 insert 复制到 profile 的 cordis.patch.yml。
+# 注意：这里刻意不写 config。allowRestart 缺省时插件会按「是否被 supervisor
+# 托管」自动判断；一旦显式写成 true，systemd 下的自动保护就会失效。
+- insert:
+    - id: manual-reboot
+      name: 'dsh-manual-reboot'

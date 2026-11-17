@@ -1,0 +1,4 @@
+{
+  "title": "YouTube 字幕",
+  "description": "抓取 YouTube 已有字幕（人工优先、自动生成兜底，零依赖），或在无字幕时用本地小模型（Paraformer / SenseVoice）做语音转字幕（纯 CPU、支持中英日韩粤）。"
+}
