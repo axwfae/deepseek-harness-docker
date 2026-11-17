@@ -1,0 +1,25 @@
+# dsh-agent2sync 的 bundle patch：把一个 Loader 条目插入组合结果。
+# 这里写的 config 就是插件的默认值，可自行修改后重载生效。
+- insert:
+    - id: agent2sync
+      name: dsh-agent2sync
+      config:
+        # 要创建/维护的模型提供商 id（请求、会话、凭据引用都用它，改名前请先想清楚）
+        providerId: agent2sync
+        # 模型选择器里显示的提供商名称（代码读的是 providerDisplayName）
+        providerDisplayName: Agent2Sync
+        # Agent2API 网关的 OpenAI 兼容端点（不含尾部 /models）
+        # 留空：网关地址是部署差异，请在 Agent2Sync 卡片里填写后保存
+        baseURL: ""
+        # 凭据引用名：网关 Key 存在 DSH 凭据里时用这个名字
+        apiKeyEnv: AGENT2SYNC_API_KEY
+        # 写入哪个插件的配置段（DSH 内置的 pi-ai 通用适配器）
+        piAiEntry: llm-pi-ai
+        # 同步端点的路径（设置卡片按它调用）
+        routePath: /agent2sync/sync
+        # 网关没报上下文长度的模型用这个兜底
+        defaultContextWindow: 128000
+        # 请求网关的超时（毫秒）
+        requestTimeoutMs: 20000
+        # 首次加载且 agent2sync 尚不存在时，自动建一次（之后全部手动触发）
+        bootstrapOnLoad: true
