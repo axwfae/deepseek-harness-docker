@@ -1,6 +1,0 @@
-node_modules
-proxy/node_modules
-manager/node_modules
-.git
-*.log
-*.err
