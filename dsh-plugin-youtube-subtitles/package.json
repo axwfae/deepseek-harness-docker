@@ -1,0 +1,57 @@
+{
+  "name": "dsh-plugin-youtube-subtitles",
+  "version": "1.6.4",
+  "private": true,
+  "type": "module",
+  "description": "YouTube 字幕抓取与无字幕语音转字幕：抓取已有字幕（零依赖），或用本地小模型（Paraformer / SenseVoice）把语音转成带时间轴的字幕。 · Fetch YouTube captions, or transcribe caption-less videos locally with a small on-device ASR model.",
+  "main": "src/index.js",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "scripts": {
+    "test": "node test/run-all.mjs",
+    "test:network": "node test/run-all.mjs --with-network"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
+    }
+  },
+  "files": [
+    "src",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "youtube",
+    "subtitles",
+    "captions",
+    "transcript",
+    "speech-to-text",
+    "asr",
+    "sensevoice",
+    "whisper"
+  ],
+  "license": "MIT"
+}

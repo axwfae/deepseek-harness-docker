@@ -1,0 +1,16 @@
+# dsh-plugin-youtube-subtitles bundle patch
+#
+# 安装方式（官方 CLI）：
+#   dsh plugin --profile web add <本目录绝对路径>
+#
+# 或通过 plugin_manager 工具 install_bundle 安装。
+#
+# 本 patch 只做一件事：在 profile 组合中插入一个插件行，把插件挂到 HOST 平面，
+# 从而对进程内所有 agent preset 生效（standard / ptc / cordis / 用户预设），
+# 而不是只对某一个 preset 生效。
+#
+# 若 profile 自带的 cordis.patch.yml 已手工挂载本插件，请先删除那一行再切换到
+# bundle 渠道，避免重复挂载。
+- insert:
+    - id: youtube-subtitles
+      name: 'dsh-plugin-youtube-subtitles'

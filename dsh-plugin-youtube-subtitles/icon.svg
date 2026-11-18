@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none"
+     stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 播放框 + 字幕条：表示「视频字幕」 -->
+  <rect x="2" y="4.5" width="20" height="13" rx="3.2" />
+  <path d="M10.2 8.6v4.8l4.2-2.4z" fill="currentColor" stroke="none" />
+  <path d="M6.2 20h5" />
+  <path d="M13.6 20h4.2" />
+</svg>
