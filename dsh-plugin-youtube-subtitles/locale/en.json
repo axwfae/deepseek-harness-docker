@@ -1,0 +1,4 @@
+{
+  "title": "YouTube Subtitles",
+  "description": "Fetch existing YouTube captions (manual first, auto-generated fallback, zero dependencies), or transcribe caption-less videos locally with a small on-device model (Paraformer / SenseVoice) on CPU."
+}
