@@ -1,0 +1,15 @@
+services:
+  lightpanda:
+    image: lightpanda/browser:latest
+    container_name: lightpanda
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9222:9222"     # 注意换端口，和 chrome 那个并存 
+    environment:
+      - LIGHTPANDA_DISABLE_TELEMETRY=true   # 官方默认会回传使用遥测，建议关掉
+    networks:
+      - llm_gateway_net      
+networks:
+  llm_gateway_net:
+    external: true
+      
