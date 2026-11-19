@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-youtube-subtitles",
-  "version": "1.6.4",
+  "version": "1.6.5",
   "private": true,
   "type": "module",
   "description": "YouTube 字幕抓取与无字幕语音转字幕：抓取已有字幕（零依赖），或用本地小模型（Paraformer / SenseVoice）把语音转成带时间轴的字幕。 · Fetch YouTube captions, or transcribe caption-less videos locally with a small on-device ASR model.",
