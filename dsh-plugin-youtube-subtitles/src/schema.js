@@ -62,9 +62,21 @@ export function boolean(meta) {
   return node('boolean', meta)
 }
 
-/** 枚举：值必须是 `values` 之一。 */
+/** 常量节点：真实 schemastery 里 union 的每个成员都是一枚 const schema。 */
+export function constNode(value) {
+  return node('const', { required: true }, { value })
+}
+
+/**
+ * 枚举：值必须是 `values` 之一。
+ *
+ * `list` 里存的是 const 节点而不是原始值——DSH 会把插件 Config 当原生
+ * schemastery 遍历（validateVolatilePlacement 等会对每个 list 成员读
+ * `node.meta.volatile`），原始字符串没有 meta 会直接抛
+ * 「Cannot read properties of undefined (reading 'volatile')」。
+ */
 export function union(values, meta) {
-  return node('union', meta, { list: values.slice() })
+  return node('union', meta, { list: values.map((value) => constNode(value)) })
 }
 
 /** 对象：只声明关心字段，未声明字段原样保留（与真实 schemastery object 行为一致）。 */
@@ -90,18 +102,19 @@ export function toJSON(root) {
     uids.set(current, uid)
 
     const out = { type: current.type }
-    if (current.meta && Object.keys(current.meta).length > 0) out.meta = { ...current.meta }
+    // 真实 schemastery 的每个节点都会输出 meta（即使为空对象）。
+    // 省略空 meta 会让宿主读 node.meta.volatile 时抛
+    // 「Cannot read properties of undefined (reading 'volatile')」。
+    out.meta = { ...(current.meta ?? {}) }
 
     if (current.type === 'object') {
       out.dict = {}
       for (const [key, child] of Object.entries(current.dict)) out.dict[key] = visit(child)
     } else if (current.type === 'union') {
-      // union 的成员在真实 schemastery 中是 const 节点
-      out.list = current.list.map((value) => {
-        const id = nextUid++
-        refs[id] = { type: 'const', meta: { required: true }, value }
-        return id
-      })
+      // union 的成员本身就是 const 节点，逐个子树序列化
+      out.list = current.list.map((child) => visit(child))
+    } else if (current.type === 'const') {
+      out.value = current.value
     }
 
     refs[uid] = out
@@ -182,9 +195,11 @@ function checkNode(schemaNode, raw, key, issues) {
       return raw
     }
     case 'union': {
-      if (!schemaNode.list.includes(raw)) {
+      // list 成员是 const 节点，取它的 value 比较
+      const allowed = (schemaNode.list ?? []).map((item) => (item && typeof item === 'object' ? item.value : item))
+      if (!allowed.includes(raw)) {
         issues.push({
-          message: `$.${key} 取值必须是 ${schemaNode.list.map((v) => JSON.stringify(v)).join(' / ')} 之一，收到 ${JSON.stringify(raw)}`,
+          message: `$.${key} 取值必须是 ${allowed.map((v) => JSON.stringify(v)).join(' / ')} 之一，收到 ${JSON.stringify(raw)}`,
           path: [key],
         })
         return undefined
@@ -202,7 +217,7 @@ function checkNode(schemaNode, raw, key, issues) {
  */
 export function createConfig(definition) {
   if (!definition || definition.type !== 'object') throw new Error('createConfig: 根节点必须是 object schema')
-  return {
+  const config = {
     ...definition,
     toJSON() {
       return toJSON(definition)
@@ -215,4 +230,14 @@ export function createConfig(definition) {
       },
     },
   }
+  // DSH 0.2.2 起，插件 Config 会被 isNativeConfigSchema() 判定：
+  // 必须同时满足 meta 是对象、type 是字符串、且带 Symbol.for('schemastery') 标记。
+  // 缺标记时设置页把该插件视为「Config is not a native Schemastery schema」，
+  // 并让条目在激活阶段失败。这里补上标记（non-enumerable，不影响序列化）。
+  Object.defineProperty(config, Symbol.for('schemastery'), {
+    value: true,
+    enumerable: false,
+    configurable: true,
+  })
+  return config
 }
