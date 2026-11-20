@@ -236,7 +236,22 @@ export function apply(ctx, config) {
       )
     })
   }
-
+  
+  const provider = {
+    id: 'lightpanda-fetch',
+    title: 'Lightpanda（远端 CDP）',
+    available() { return true },
+    async fetch(request, signal) {
+      const { client, sessionId, targetId } = await bridge.createTarget()
+      try {
+        await navigate(client, sessionId, url, 'load', endpoint.timeoutMs)
+        const dump = await client.send('LP.dump', { format: 'markdown', maxBytes: 2_000_000 }, sessionId)
+        return { url, statusCode: 200, body: { kind: 'text', content }, truncated }
+      } finally { await bridge.closeTarget(targetId).catch(() => {}) }
+    },
+  }
+  scope.effect(() => seam.registerFetchProvider(provider), 'lightpanda-cdp: web fetch provider')
+  
   // -- lp_config ------------------------------------------------------------
   ctx.tools.register({
     name: 'lp_config',
