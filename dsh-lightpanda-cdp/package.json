@@ -1,6 +1,6 @@
 {
   "name": "dsh-lightpanda-cdp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drive a remote Lightpanda headless browser over CDP from DeepSeek Harness: open pages, read markdown, list interactive elements, click/fill, screenshot and evaluate JS.",
   "private": true,
   "type": "module",
