@@ -237,20 +237,50 @@ export function apply(ctx, config) {
     })
   }
   
-  const provider = {
-    id: 'lightpanda-fetch',
-    title: 'Lightpanda（远端 CDP）',
-    available() { return true },
-    async fetch(request, signal) {
-      const { client, sessionId, targetId } = await bridge.createTarget()
-      try {
-        await navigate(client, sessionId, url, 'load', endpoint.timeoutMs)
-        const dump = await client.send('LP.dump', { format: 'markdown', maxBytes: 2_000_000 }, sessionId)
-        return { url, statusCode: 200, body: { kind: 'text', content }, truncated }
-      } finally { await bridge.closeTarget(targetId).catch(() => {}) }
-    },
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['web'], (scope) => {
+      const seam = typeof scope.get === 'function' ? scope.get('web') : undefined
+      if (!seam || typeof seam.registerFetchProvider !== 'function') return
+      const provider = {
+        id: 'lightpanda-fetch',
+        title: 'Lightpanda（远端 CDP）',
+        description: 'Drive the configured remote headless Lightpanda: render the page, run its JS, return Markdown. Needs no local browser.',
+        // Cheap local check only: the seam forbids network calls here.
+        available() { return true },
+        async fetch(request, signal) {
+          const url = String(request?.url ?? '')
+          if (!/^https?:\/\//i.test(url)) {
+            throw new Error(`lightpanda-fetch: unsupported URL scheme: ${url}`)
+          }
+          if (signal?.aborted) throw new Error('lightpanda-fetch: request aborted before start')
+          const endpoint = store.resolve()
+          const { client, sessionId, targetId } = await bridge.createTarget()
+          const onAbort = () => { bridge.closeTarget(targetId).catch(() => {}) }
+          signal?.addEventListener?.('abort', onAbort, { once: true })
+          try {
+            await navigate(client, sessionId, url, 'load', endpoint.timeoutMs)
+            const dump = await client.send(
+              'LP.dump',
+              { format: 'markdown', maxBytes: 2_000_000 },
+              sessionId,
+              endpoint.timeoutMs,
+            )
+            const content = String(dump?.content ?? '')
+            if (content.trim().length === 0) {
+              throw new Error(`lightpanda-fetch: document rendered empty (${url})`)
+            }
+            const truncated = Boolean(dump?.truncated) || /\[truncated\]\s*$/u.test(content)
+            return { url, statusCode: 200, body: { kind: 'text', content }, truncated }
+          }
+          finally {
+            signal?.removeEventListener?.('abort', onAbort)
+            await bridge.closeTarget(targetId).catch(() => {})
+          }
+        },
+      }
+      scope.effect(() => seam.registerFetchProvider(provider), 'lightpanda-cdp: web fetch provider')
+    })
   }
-  scope.effect(() => seam.registerFetchProvider(provider), 'lightpanda-cdp: web fetch provider')
   
   // -- lp_config ------------------------------------------------------------
   ctx.tools.register({
